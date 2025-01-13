@@ -17,6 +17,31 @@ public:
   std::unique_ptr<xrt_core::buffer_handle>
   alloc_bo(void* userptr, size_t size, uint64_t flags) override;
 
+  enum umq_log_flag {
+    debug_buffer = 0,
+    trace_buffer
+  };
+
+  struct umq_log_metadata {
+    #define UMQ_MAGIC_NO 0x43455254
+    uint32_t magic_no;
+    uint8_t major;
+    uint8_t minor;
+    uint8_t umq_log_flag;
+    uint8_t num_cols;       // how many valid cols, up to 8 for now
+    uint64_t col_paddr[8];  // device accessible address array for each valid col
+    uint32_t col_size[8];    // bo size for each valid col
+  };
+
+  void
+  set_metadata(int num_cols, size_t size, uint64_t bo_paddr, uint8_t flag);
+
+  void
+  init_log_buf();
+
+private:
+  struct umq_log_metadata m_metadata;
+
 };
 
 } // shim_xdna
