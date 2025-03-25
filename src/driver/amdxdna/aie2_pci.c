@@ -1044,6 +1044,36 @@ static int aie2_get_force_preempt_state(struct amdxdna_client *client,
 	return 0;
 }
 
+static int aie2_get_resource_info(struct amdxdna_client *client,
+				  struct amdxdna_drm_get_info *args)
+{
+	struct amdxdna_drm_get_resource_info res_info = {};
+	struct amdxdna_dev *xdna = client->xdna;
+	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+	const struct amdxdna_dev_priv *pdev = ndev->priv;
+	int ret = 0;
+
+	res_info.ipu_clk_max = pdev->dpm_clk_tbl[ndev->max_dpm_level - 2].hclk;
+	res_info.ipu_task_max = pdev->hwctx_limit;
+	res_info.ipu_task_curr = ndev->hwctx_cnt;
+	u32 total_col = ndev->total_col;
+	u32 hclk_freq = ndev->hclk_freq;
+
+	if (pdev->protocol_major == 0x5 && pdev->protocol_minor == 0x5) { // For PHX
+		res_info.ipu_tops_max = 2 * total_col;
+		res_info.ipu_tops_curr = hclk_freq * 2 * total_col / 1028;
+	} else {
+		res_info.ipu_tops_max = 4096 * total_col * pdev->dpm_clk_tbl
+		[ndev->max_dpm_level - 2].hclk / 1000000;
+		res_info.ipu_tops_curr = 4096 * hclk_freq * total_col / 1000000;
+	}
+
+	if (copy_to_user(u64_to_user_ptr(args->buffer), &res_info, sizeof(res_info)))
+		ret = -EFAULT;
+
+	return ret;
+}
+
 static int aie2_get_info(struct amdxdna_client *client, struct amdxdna_drm_get_info *args)
 {
 	struct amdxdna_dev *xdna = client->xdna;
@@ -1093,6 +1123,9 @@ static int aie2_get_info(struct amdxdna_client *client, struct amdxdna_drm_get_i
 		break;
 	case DRM_AMDXDNA_GET_FORCE_PREEMPT_STATE:
 		ret = aie2_get_force_preempt_state(client, args);
+		break;
+	case DRM_AMDXDNA_QUERY_RESOURCE_INFO:
+		ret = aie2_get_resource_info(client, args);
 		break;
 	default:
 		XDNA_ERR(xdna, "Not supported request parameter %u", args->param);
