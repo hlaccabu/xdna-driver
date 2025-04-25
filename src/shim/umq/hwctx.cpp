@@ -59,9 +59,13 @@ set_metadata(int num_ucs, size_t size, uint64_t bo_paddr, enum umq_log_flag flag
   m_metadata.minor = 1;
   m_metadata.umq_log_flag = flag;
   m_metadata.num_ucs = num_ucs;
+  if (num_ucs > MAX_UC_NUMBERS) {
+    throw xrt_core::error("Max number of UCs exceeded");
+    return;
+  }
   for (int i = 0; i < num_ucs; i++) {
-    m_metadata.uc_paddr[i] = bo_paddr + size * i + sizeof(m_metadata);
-    m_metadata.uc_size[i] = size;
+    m_metadata.uc_info[i].paddr = bo_paddr + size * i + sizeof(m_metadata);
+    m_metadata.uc_info[i].size = size;
   }
 }
 
