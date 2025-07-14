@@ -22,7 +22,7 @@ hwctx_umq(const device& device, const xrt::xclbin& xclbin, const qos_type& qos)
 hwctx_umq::
 hwctx_umq(const device& device, uint32_t partition_size)
   : hwctx(device, partition_size, std::make_unique<hwq_umq>(device, 8))
-  , m_metadata()
+  , m_pdev(device.get_pdev())
 {
   m_col_cnt = partition_size;
 
@@ -64,7 +64,7 @@ init_log_buf()
   
   // TODO: configure log BO on the hwctx once driver and fw support it
   // we may use xrt.ini to control the config
-  //m_log_bo->config(this, buf_sizes);
+  m_log_bo->config(this, buf_sizes);
 }
 
 void

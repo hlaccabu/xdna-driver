@@ -84,7 +84,7 @@ page_size_roundup(size_t size)
 }
 
 std::string
-type_to_name(int type)
+type_to_name(int type, uint64_t flags)
 {
   switch (type) {
   case AMDXDNA_BO_SHARE:
@@ -553,7 +553,7 @@ describe() const
   std::string desc = bo_sub_type_name() + ": ";
 
   desc += "type=";
-  desc += type_to_name(m_type);
+  desc += type_to_name(m_type, m_flags);
   desc += " ";
   desc += "hdl=";
   for (int i = 0; i < m_bos.size(); i++) {
