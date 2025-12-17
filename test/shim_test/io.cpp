@@ -384,6 +384,51 @@ elf_io_test_bo_set(device* dev, const std::string& xclbin_name) :
   }
 }
 
+elf_full_io_test_bo_set::
+elf_full_io_test_bo_set(device* dev, const std::string& xclbin_name)
+  : io_test_bo_set_base(dev, xclbin_name)
+{
+  std::cout << "elf_full_io_test_bo_set: Loading ELF..." << std::endl;
+  auto elf_path = get_xclbin_path(dev, xclbin_name.c_str());
+  std::cout << "ELF path: " << elf_path << std::endl;
+  
+  m_elf = xrt::elf(elf_path);
+  std::cout << "ELF loaded, creating module..." << std::endl;
+  
+  auto mod = xrt::module{m_elf};
+  std::cout << "Module created, getting kernel name..." << std::endl;
+  
+  auto kernel_name = get_kernel_name(dev, xclbin_name.c_str());
+  std::cout << "Kernel name: " << kernel_name << std::endl;
+  
+  try {
+    m_kernel_index = module_int::get_ctrlcode_id(mod, kernel_name);
+    std::cout << "Kernel index: " << m_kernel_index << std::endl;
+  } catch (const std::exception& e) {
+    std::cerr << "Warning: Failed to get kernel index: " << e.what() << std::endl;
+    m_kernel_index = module_int::no_ctrl_code_id;
+  }
+
+  std::cout << "Starting BO allocation loop..." << std::endl;
+  for (int i = 0; i < IO_TEST_BO_MAX_TYPES; i++) {
+    std::cout << "Allocating BO type " << i << std::endl;    
+    auto& ibo = m_bo_array[i];
+    auto type = static_cast<io_test_bo_type>(i);
+
+    switch(type) {
+    case IO_TEST_BO_CMD:
+      alloc_cmd_bo(ibo, m_dev);
+      break;
+    case IO_TEST_BO_INSTRUCTION:
+      create_ctrl_bo_from_elf(ibo, patcher::buf_type::ctrltext);
+      break;
+    default:
+      break;
+    }
+  }
+  std::cout << "elf_full_io_test_bo_set constructor complete" << std::endl;
+}
+
 elf_preempt_io_test_bo_set::
 elf_preempt_io_test_bo_set(device* dev, const std::string& xclbin_name)
   : io_test_bo_set_base(dev, xclbin_name)
@@ -604,6 +649,24 @@ init_cmd(hw_ctx& hwctx, bool dump)
   ebuf.patch_ctrl_code(*m_bo_array[IO_TEST_BO_INSTRUCTION].tbo.get(),
     patcher::buf_type::ctrltext, m_elf, module_int::no_ctrl_code_id);
 }
+
+void
+elf_full_io_test_bo_set::
+init_cmd(hw_ctx& hwctx, bool dump)
+{
+  exec_buf ebuf(*m_bo_array[IO_TEST_BO_CMD].tbo.get(), ERT_START_DPU);
+  
+  xrt_core::cuidx_type cu_idx{0};
+  ebuf.set_cu_idx(cu_idx);
+  
+  if (dump)
+    ebuf.dump();
+
+  ebuf.add_ctrl_bo(*m_bo_array[IO_TEST_BO_INSTRUCTION].tbo.get());
+  ebuf.patch_ctrl_code(*m_bo_array[IO_TEST_BO_INSTRUCTION].tbo.get(),
+    patcher::buf_type::ctrltext, m_elf, m_kernel_index);
+}
+
 
 void
 elf_preempt_io_test_bo_set::

@@ -63,6 +63,17 @@ xclbin_info xclbin_infos[] = {
     .data = "data",
   },
   {
+    .name = "nop.elf",
+    .device = npu3_device_id,
+    .revision_id = npu_any_revision_id,
+    .ip_name2idx = {
+      { "DPU:nop", {0xffffffff} },
+    },
+    .workspace = "npu3_workspace",
+    .data = "",
+    .type = KERNEL_TYPE_TXN_FULL_ELF,
+  },
+  {
     .name = "vadd.elf",
     .device = npu3_device_id,
     .revision_id = npu_any_revision_id,
@@ -71,7 +82,7 @@ xclbin_info xclbin_infos[] = {
     },
     .workspace = "npu3_workspace",
     .data = "",
-    .type = KERNEL_TYPE_TXN_FULL_ELF_PREEMPT,
+    .type = KERNEL_TYPE_TXN_FULL_ELF,
   },
   {
     .name = "vadd.elf",
