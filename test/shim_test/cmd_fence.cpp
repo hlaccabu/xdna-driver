@@ -167,6 +167,7 @@ TEST_cmd_fence_device(device::id_type id, std::shared_ptr<device>& sdev, arg_typ
   // Can't fork with opened device.
   sdev.reset();
 
+  io_test_bo_set_base::clear_cmd_header_cache();
   test_2proc_cmd_fence_device t2p(id);
   t2p.run_test();
 }

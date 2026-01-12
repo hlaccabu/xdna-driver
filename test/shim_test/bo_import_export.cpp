@@ -40,6 +40,7 @@ private:
     auto sdev = get_userpf_device(get_dev_id());
     auto dev = sdev.get();
 
+    io_test_bo_set_base::clear_cmd_header_cache();
     io_test_bo_set boset{dev};
     boset.get_bos()[IO_TEST_BO_INPUT].tbo = std::make_shared<bo>(dev, idata.pid, idata.hdl);
     boset.run();
@@ -77,6 +78,7 @@ TEST_export_import_bo(device::id_type id, std::shared_ptr<device>& sdev, const s
 void
 TEST_export_import_bo_single_proc(device::id_type id, std::shared_ptr<device>& sdev, const std::vector<uint64_t>& arg)
 {
+  io_test_bo_set_base::clear_cmd_header_cache();
   auto dev = sdev.get();
 
   // Create IO test BO set and share input BO with same process

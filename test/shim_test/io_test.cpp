@@ -15,7 +15,6 @@
 
 using namespace xrt_core;
 using arg_type = const std::vector<uint64_t>;
-bool dev_filter_is_aie4(device::id_type id, device* dev);
 
 namespace {
 
@@ -118,67 +117,43 @@ io_test_cmd_submit_and_wait_latency(
   hwqueue_handle *hwq,
   int total_cmd_submission,
   std::vector< std::pair<std::shared_ptr<bo>, ert_start_kernel_cmd *> >& cmdlist_bos,
-  std::vector< std::unique_ptr<io_test_bo_set_base> >* bo_set_ptr = nullptr,
-  std::vector<uint32_t>* chain_headers = nullptr,
-  int cmds_per_list = 1
+  std::vector< std::unique_ptr<io_test_bo_set_base> >& bo_set,
+  int cmds_per_list
   )
 {
   int completed = 0;
 
   while (completed < total_cmd_submission) {
-    for (size_t i = 0; i < cmdlist_bos.size(); i++) {
-      auto& cmd = cmdlist_bos[i];
-      // For UMQ, restore header before resubmission
-      if (completed > 0) {
-        if (chain_headers && i < chain_headers->size()) {
-          if (bo_set_ptr) {
-            int start_idx = i * cmds_per_list;
-            int end_idx = start_idx + cmds_per_list;
-            for (int idx = start_idx; idx < end_idx && idx < bo_set_ptr->size(); idx++) {
-              (*bo_set_ptr)[idx]->restore_cmd_header();
-            }
-          }
-          // Restore chain BO header
-          auto pkt = reinterpret_cast<ert_packet *>(std::get<0>(cmd)->map());
-          pkt->header = (*chain_headers)[i];
-          pkt->state = ERT_CMD_STATE_NEW;
-          std::get<0>(cmd)->get()->sync(buffer_handle::direction::host2device, std::get<0>(cmd)->size(), 0);
-          std::atomic_thread_fence(std::memory_order_seq_cst);
-        } else if (bo_set_ptr && i < bo_set_ptr->size()) {
-          // Single command: restore from bo_set
-          (*bo_set_ptr)[i]->restore_cmd_header();
+    size_t cmd_idx = 0;
+    for (auto& cmd : cmdlist_bos) {
+      auto cmd_hdl = std::get<0>(cmd).get()->get();
+      auto cmd_pkt = std::get<1>(cmd);
+
+      if (cmd_pkt->opcode == ERT_CMD_CHAIN) {
+        size_t start_idx = cmd_idx * cmds_per_list;
+        size_t end_idx = std::min(start_idx + cmds_per_list, bo_set.size());
+        for (size_t i = start_idx; i < end_idx; i++) {
+          auto subcmd_bo = bo_set[i]->get_bos()[IO_TEST_BO_CMD].tbo.get();
+          auto subcmd_pkt = reinterpret_cast<ert_start_kernel_cmd *>(subcmd_bo->map());
+          io_test_bo_set_base::restore_cmd_header(subcmd_bo->get(), subcmd_pkt);
         }
-      }
-      hwq->submit_command(std::get<0>(cmd).get()->get());
-      io_test_cmd_wait(hwq, std::get<0>(cmd));
-      // For UMQ chain commands, sync the chain BO from device to host before checking state
-      uint32_t state;
-      if (chain_headers && i < chain_headers->size()) {
-        std::get<0>(cmd)->get()->sync(buffer_handle::direction::device2host,
-                                       std::get<0>(cmd)->size(), 0);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        auto pkt = reinterpret_cast<volatile ert_start_kernel_cmd *>(std::get<0>(cmd)->map());
-        state = pkt->state;
-      } else {
-        if (bo_set_ptr && i < bo_set_ptr->size()) {
-          std::atomic_thread_fence(std::memory_order_acquire);
-        }
-        state = std::get<1>(cmd)->state;
-      }
-      if (state != ERT_CMD_STATE_COMPLETED) {
-        std::string errmsg = "Command ";
-        errmsg += std::to_string(completed);
-        errmsg += " failed, state=";
-        errmsg += std::to_string(state);
-        throw std::runtime_error(errmsg);
       }
 
+      io_test_bo_set_base::restore_cmd_header(cmd_hdl, cmd_pkt);
+      io_test_bo_set_base::cache_cmd_header(cmd_hdl, cmd_pkt);
+
+      hwq->submit_command(cmd_hdl);
+      io_test_cmd_wait(hwq, std::get<0>(cmd));
+
+      if (cmd_pkt->state != ERT_CMD_STATE_COMPLETED)
+        throw std::runtime_error("Command " + std::to_string(completed) +
+                                 " failed, state=" + std::to_string(cmd_pkt->state));
+
       completed++;
+      cmd_idx++;
       if (completed >= total_cmd_submission)
         break;
-      // For KMQ, just reset state
-      if (!bo_set_ptr && !chain_headers)
-        std::get<1>(cmd)->state = ERT_CMD_STATE_NEW;
+      cmd_pkt->state = ERT_CMD_STATE_NEW;
     }
   }
 }
@@ -188,71 +163,51 @@ io_test_cmd_submit_and_wait_thruput(
   hwqueue_handle *hwq,
   int total_cmd_submission,
   std::vector< std::pair<std::shared_ptr<bo>, ert_start_kernel_cmd *> >& cmdlist_bos,
-  std::vector< std::unique_ptr<io_test_bo_set_base> >* bo_set_ptr = nullptr,
-  std::vector<uint32_t>* chain_headers = nullptr,
-  int cmds_per_list = 1
+  std::vector< std::unique_ptr<io_test_bo_set_base> >& bo_set,
+  int cmds_per_list
   )
 {
   int issued = 0;
   int completed = 0;
-  int wait_idx = 0;
+  size_t wait_idx = 0;
 
   for (auto& cmd : cmdlist_bos) {
-    // For KMQ, reset state before initial submission
-    if (!bo_set_ptr && !chain_headers)
-      std::get<1>(cmd)->state = ERT_CMD_STATE_NEW;
-    
-    hwq->submit_command(std::get<0>(cmd).get()->get());
-    issued++;
-    if (issued >= total_cmd_submission)
+    auto cmd_hdl = std::get<0>(cmd).get()->get();
+    auto cmd_pkt = std::get<1>(cmd);
+
+    io_test_bo_set_base::cache_cmd_header(cmd_hdl, cmd_pkt);
+    cmd_pkt->state = ERT_CMD_STATE_NEW;
+    hwq->submit_command(cmd_hdl);
+    if (++issued >= total_cmd_submission)
       break;
   }
 
   while (completed < issued) {
     io_test_cmd_wait(hwq, std::get<0>(cmdlist_bos[wait_idx]));
-    // For UMQ chain commands, sync the chain BO from device to host before checking state
-    uint32_t state;
-    if (chain_headers && wait_idx < chain_headers->size()) {
-      std::get<0>(cmdlist_bos[wait_idx])->get()->sync(buffer_handle::direction::device2host,
-                                                       std::get<0>(cmdlist_bos[wait_idx])->size(), 0);
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      // Use volatile pointer to force memory read after sync
-      auto pkt = reinterpret_cast<volatile ert_start_kernel_cmd *>(std::get<0>(cmdlist_bos[wait_idx])->map());
-      state = pkt->state;
-    } else {
-      state = std::get<1>(cmdlist_bos[wait_idx])->state;
-    }
-    if (state != ERT_CMD_STATE_COMPLETED)
-      throw std::runtime_error(std::string("Command failed, state=") + std::to_string(state));
+    auto cmd_pkt = std::get<1>(cmdlist_bos[wait_idx]);
+    if (cmd_pkt->state != ERT_CMD_STATE_COMPLETED)
+      throw std::runtime_error("Command failed, state=" + std::to_string(cmd_pkt->state));
     completed++;
 
     if (issued < total_cmd_submission) {
-      // For UMQ, restore header; for KMQ, just reset state
-      if (chain_headers && wait_idx < chain_headers->size()) {
-        // Chain command: restore individual cmd BO headers for this specific chain
-        if (bo_set_ptr) {
-          int start_idx = wait_idx * cmds_per_list;
-          int end_idx = start_idx + cmds_per_list;
-          for (int i = start_idx; i < end_idx && i < bo_set_ptr->size(); i++) {
-            (*bo_set_ptr)[i]->restore_cmd_header();
-          }
+      auto cmd_hdl = std::get<0>(cmdlist_bos[wait_idx]).get()->get();
+
+      if (cmd_pkt->opcode == ERT_CMD_CHAIN) {
+        size_t start_idx = wait_idx * cmds_per_list;
+        size_t end_idx = std::min(start_idx + cmds_per_list, bo_set.size());
+        for (size_t i = start_idx; i < end_idx; i++) {
+          auto subcmd_bo = bo_set[i]->get_bos()[IO_TEST_BO_CMD].tbo.get();
+          auto subcmd_pkt = reinterpret_cast<ert_start_kernel_cmd *>(subcmd_bo->map());
+          io_test_bo_set_base::restore_cmd_header(subcmd_bo->get(), subcmd_pkt);
         }
-        auto pkt = reinterpret_cast<ert_packet *>(std::get<0>(cmdlist_bos[wait_idx])->map());
-        pkt->header = (*chain_headers)[wait_idx];
-        pkt->state = ERT_CMD_STATE_NEW;
-        std::get<0>(cmdlist_bos[wait_idx])->get()->sync(buffer_handle::direction::host2device,
-                                                        std::get<0>(cmdlist_bos[wait_idx])->size(), 0);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-      } else if (bo_set_ptr && wait_idx < bo_set_ptr->size()) {
-        (*bo_set_ptr)[wait_idx]->restore_cmd_header();
-      } else {
-        std::get<1>(cmdlist_bos[wait_idx])->state = ERT_CMD_STATE_NEW;
       }
 
-      hwq->submit_command(std::get<0>(cmdlist_bos[wait_idx]).get()->get());
+      io_test_bo_set_base::restore_cmd_header(cmd_hdl, cmd_pkt);
+      cmd_pkt->state = ERT_CMD_STATE_NEW;
+      hwq->submit_command(cmd_hdl);
       issued++;
     }
-    
+
     if (++wait_idx == cmdlist_bos.size())
       wait_idx = 0;
   }
@@ -322,7 +277,7 @@ void
 io_test(device::id_type id, device* dev, int total_hwq_submit, int num_cmdlist,
   int cmds_per_list, const char *xclbin)
 {
-  bool is_umq = dev_filter_is_aie4(id, dev);
+  io_test_bo_set_base::clear_cmd_header_cache();
   // Allocate set of BOs for command submission based on num_cmdlist and cmds_per_list
   // Intentionally this is done before context creation to make sure BO and context
   // are totally decoupled.
@@ -337,14 +292,11 @@ io_test(device::id_type id, device* dev, int total_hwq_submit, int num_cmdlist,
   // Initialize cmd before submission
   for (auto& boset : bo_set) {
     boset->init_cmd(hwctx, io_test_parameters.debug);
-    boset->cache_cmd_header();
     boset->sync_before_run();
   }
 
   // Creating list of commands to be submitted
   std::vector< std::pair<std::shared_ptr<bo>, ert_start_kernel_cmd *> > cmdlist_bos;
-  std::vector<uint32_t> chain_bo_cached_headers;
-
   if (cmds_per_list == 1) {
     // Single command per list, just send the command BO itself
     for (auto& boset : bo_set) {
@@ -356,18 +308,15 @@ io_test(device::id_type id, device* dev, int total_hwq_submit, int num_cmdlist,
     // Multiple commands per list, create and send the chained command
     std::vector<bo*> tmp_cmd_bos;
     for (auto& boset : bo_set) {
-      tmp_cmd_bos.push_back(boset->get_bos()[IO_TEST_BO_CMD].tbo.get());
+      auto subcmd_bo = boset->get_bos()[IO_TEST_BO_CMD].tbo.get();
+      auto subcmd_pkt = reinterpret_cast<ert_start_kernel_cmd *>(subcmd_bo->map());
+      io_test_bo_set_base::cache_cmd_header(subcmd_bo->get(), subcmd_pkt);
+      tmp_cmd_bos.push_back(subcmd_bo);
       if ((tmp_cmd_bos.size() % cmds_per_list) == 0) {
         auto cbo = std::make_unique<bo>(dev, 0x1000ul, XCL_BO_FLAGS_EXECBUF);
         auto cmdpkt = reinterpret_cast<ert_start_kernel_cmd *>(cbo->map());
         io_test_init_runlist_cmd(cbo.get(), tmp_cmd_bos);
-        // Sync the chain BO to device after initialization
-        cbo->get()->sync(buffer_handle::direction::host2device, cbo->size(), 0);
-        if (is_umq) {
-          auto pkt = reinterpret_cast<ert_packet *>(cbo->map());
-          chain_bo_cached_headers.push_back(pkt->header);
-        }
-
+        io_test_bo_set_base::cache_cmd_header(cbo->get(), cmdpkt);
         tmp_cmd_bos.clear();
         cmdlist_bos.push_back( {std::move(cbo), cmdpkt} );
       }
@@ -384,17 +333,10 @@ io_test(device::id_type id, device* dev, int total_hwq_submit, int num_cmdlist,
 
   // Submit commands and wait for results
   auto start = clk::now();
-  if (io_test_parameters.perf == IO_TEST_THRUPUT_PERF) {
-    io_test_cmd_submit_and_wait_thruput(hwq, total_hwq_submit, cmdlist_bos,
-                                        is_umq ? &bo_set : nullptr,
-                                        (is_umq && cmds_per_list > 1) ? &chain_bo_cached_headers : nullptr,
-                                        cmds_per_list);
-  } else {
-    io_test_cmd_submit_and_wait_latency(hwq, total_hwq_submit, cmdlist_bos, 
-                                        is_umq ? &bo_set : nullptr,
-                                        (is_umq && cmds_per_list > 1) ? &chain_bo_cached_headers : nullptr,
-                                        cmds_per_list);
-  }
+  if (io_test_parameters.perf == IO_TEST_THRUPUT_PERF)
+    io_test_cmd_submit_and_wait_thruput(hwq, total_hwq_submit, cmdlist_bos, bo_set, cmds_per_list);
+  else
+    io_test_cmd_submit_and_wait_latency(hwq, total_hwq_submit, cmdlist_bos, bo_set, cmds_per_list);
   auto end = clk::now();
 
   // Verify preemption counters
@@ -449,9 +391,10 @@ TEST_io_latency(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg
   unsigned int run_type = static_cast<unsigned int>(arg[0]);
   unsigned int wait_type = static_cast<unsigned int>(arg[1]);
   unsigned int total = static_cast<unsigned int>(arg[2]);
+  bool elf = arg[3];
 
   io_test_parameter_init(IO_TEST_LATENCY_PERF, run_type, wait_type);
-  io_test(id, sdev.get(), total, 1, 1, run_type == IO_TEST_NOOP_RUN ? "nop.xclbin" : nullptr);
+  io_test(id, sdev.get(), total, 1, 1, run_type == IO_TEST_NOOP_RUN ? (elf ? "nop.elf" : "nop.xclbin") : nullptr);
 }
 
 void
@@ -460,9 +403,10 @@ TEST_io_throughput(device::id_type id, std::shared_ptr<device>& sdev, arg_type& 
   unsigned int run_type = static_cast<unsigned int>(arg[0]);
   unsigned int wait_type = static_cast<unsigned int>(arg[1]);
   unsigned int total = static_cast<unsigned int>(arg[2]);
+  bool elf = arg[3];
 
   io_test_parameter_init(IO_TEST_THRUPUT_PERF, run_type, wait_type);
-  io_test(id, sdev.get(), total, 8, 1, run_type == IO_TEST_NOOP_RUN ? "nop.xclbin" : nullptr);
+  io_test(id, sdev.get(), total, 8, 1, run_type == IO_TEST_NOOP_RUN ? (elf ? "nop.elf" : "nop.xclbin") : nullptr);
 }
 
 void
@@ -471,6 +415,7 @@ TEST_io_runlist_latency(device::id_type id, std::shared_ptr<device>& sdev, arg_t
   unsigned int run_type = static_cast<unsigned int>(arg[0]);
   unsigned int wait_type = static_cast<unsigned int>(arg[1]);
   unsigned int total = static_cast<unsigned int>(arg[2]);
+  bool elf = arg[3];
   const size_t max_cmd_per_list = 24;
 
   io_test_parameter_init(IO_TEST_LATENCY_PERF, run_type, wait_type);
@@ -479,7 +424,7 @@ TEST_io_runlist_latency(device::id_type id, std::shared_ptr<device>& sdev, arg_t
       cmds_per_list = max_cmd_per_list;
     int total_hwq_submit = total / cmds_per_list;
     io_test(id, sdev.get(), total_hwq_submit, 1, cmds_per_list,
-      run_type == IO_TEST_NOOP_RUN ? "nop.xclbin" : nullptr);
+      run_type == IO_TEST_NOOP_RUN ? (elf ? "nop.elf" : "nop.xclbin") : nullptr);
   }
 }
 
@@ -489,24 +434,25 @@ TEST_io_runlist_throughput(device::id_type id, std::shared_ptr<device>& sdev, ar
   unsigned int run_type = static_cast<unsigned int>(arg[0]);
   unsigned int wait_type = static_cast<unsigned int>(arg[1]);
   unsigned int total_commands = static_cast<unsigned int>(arg[2]);
+  bool elf = arg[3];
   int num_bo_set = 256;
   const size_t max_cmd_per_list = 24;
 
   io_test_parameter_init(IO_TEST_THRUPUT_PERF, run_type, wait_type);
-
   for (int cmds_per_list = 1; cmds_per_list <= 32; cmds_per_list *= 2) {
     if (cmds_per_list > max_cmd_per_list)
       cmds_per_list = max_cmd_per_list;
     int num_cmdlist = num_bo_set / cmds_per_list;
     int total_hwq_submit = total_commands / cmds_per_list;
     io_test(id, sdev.get(), total_hwq_submit, num_cmdlist, cmds_per_list,
-      run_type == IO_TEST_NOOP_RUN ? "nop.xclbin" : nullptr);
+      run_type == IO_TEST_NOOP_RUN ? (elf ? "nop.elf" : "nop.xclbin") : nullptr);
   }
 }
 
 void
 TEST_noop_io_with_dup_bo(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 {
+  io_test_bo_set_base::clear_cmd_header_cache();
   io_test_bo_set boset{sdev.get()};
 
   // Use same BO for both input and output
@@ -541,6 +487,7 @@ TEST_preempt_elf_io(device::id_type id, std::shared_ptr<device>& sdev, const std
 void
 TEST_io_with_ubuf_bo(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 {
+  io_test_bo_set_base::clear_cmd_header_cache();
   io_test_bo_set boset{sdev.get(), true};
   boset.run();
 }
@@ -548,6 +495,7 @@ TEST_io_with_ubuf_bo(device::id_type id, std::shared_ptr<device>& sdev, arg_type
 void
 TEST_io_suspend_resume(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 {
+  io_test_bo_set_base::clear_cmd_header_cache();
   /*
    * For this code path, we expecte 2 times of suspend and resume
    * in dmesg log if dyndbg=+pf is set.
@@ -578,6 +526,7 @@ TEST_preempt_full_elf_io(device::id_type id, std::shared_ptr<device>& sdev, cons
 void
 TEST_io_timeout(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 {
+  io_test_bo_set_base::clear_cmd_header_cache();
   elf_io_negative_test_bo_set boset{sdev.get(),
     "bad_txn.xclbin", "ert_crash.elf", ERT_CMD_STATE_TIMEOUT, 0x11800};
   boset.run();
@@ -586,6 +535,7 @@ TEST_io_timeout(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg
 void
 TEST_async_error_io(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 {
+  io_test_bo_set_base::clear_cmd_header_cache();
   async_error_io_test_bo_set async_error_io_test_bo_set{sdev.get()};
   // verification is inside run()
   async_error_io_test_bo_set.run();
@@ -635,6 +585,7 @@ void TEST_async_error_multi(device::id_type id, std::shared_ptr<device>& sdev, a
 void
 TEST_instr_invalid_addr_io(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 {
+  io_test_bo_set_base::clear_cmd_header_cache();
   elf_io_negative_test_bo_set bo_set{sdev.get(),
     "bad_txn.xclbin", "instr_invalid_addr.elf", ERT_CMD_STATE_TIMEOUT, 0xFFFFFFFF};
   bo_set.run();
@@ -646,6 +597,7 @@ TEST_instr_invalid_addr_io(device::id_type id, std::shared_ptr<device>& sdev, ar
 void
 TEST_io_gemm(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 {
+  io_test_bo_set_base::clear_cmd_header_cache();
   elf_io_gemm_test_bo_set boset{sdev.get(), "gemm.xclbin", "gemm_int8.elf"};
   boset.run();
 }
@@ -653,6 +605,7 @@ TEST_io_gemm(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 void
 TEST_io_runlist_bad_cmd(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 {
+  io_test_bo_set_base::clear_cmd_header_cache();
   bool is_timeout = static_cast<bool>(arg[0]);
   const char *good_xclbin = "design.xclbin";
   const char *bad_xclbin = "bad_txn.xclbin";
@@ -700,8 +653,12 @@ TEST_io_runlist_bad_cmd(device::id_type id, std::shared_ptr<device>& sdev, arg_t
 
   // Submit the chained command and wait for completion/timeout
   auto hwq = hwctx.get()->get_hw_queue();
-  hwq->submit_command(cbo->get());
-  hwq->wait_command(cbo->get(), 0);
+  auto cmd_hdl = cbo->get();
+  auto cmd_pkt = reinterpret_cast<ert_start_kernel_cmd *>(cbo->map());
+  
+  io_test_bo_set_base::cache_cmd_header(cmd_hdl, cmd_pkt);
+  hwq->submit_command(cmd_hdl);
+  hwq->wait_command(cmd_hdl, 0);
 
   // Check the result
   auto cmd_packet = reinterpret_cast<ert_packet *>(cbo->map());
