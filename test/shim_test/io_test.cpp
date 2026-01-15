@@ -51,6 +51,9 @@ alloc_and_init_bo_set(device* dev, const char *tag, const flow_type* flow = null
   case PREEMPT_FULL_ELF:
     base = std::make_unique<elf_preempt_io_test_bo_set>(dev, tag_str, flow);
     break;
+  case KERNEL_TYPE_TXN_FULL_ELF_PREEMPT_AIE4:
+    base = std::make_unique<elf_preempt_aie4_io_test_bo_set>(dev, std::string(xclbin));
+    break;
   default:
     throw std::runtime_error("Unknown flow type");
   }
