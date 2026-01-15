@@ -49,6 +49,9 @@ alloc_and_init_bo_set(device* dev, const char *xclbin)
   case KERNEL_TYPE_TXN_FULL_ELF_PREEMPT:
     base = std::make_unique<elf_preempt_io_test_bo_set>(dev, std::string(xclbin));
     break;
+  case KERNEL_TYPE_TXN_FULL_ELF_PREEMPT_AIE4:
+    base = std::make_unique<elf_preempt_aie4_io_test_bo_set>(dev, std::string(xclbin));
+    break;
   default:
     throw std::runtime_error("Unknown kernel type");
   }
@@ -254,6 +257,11 @@ get_fine_preemption_counter_delta(device *dev, hw_ctx& ctx, std::vector<std::pai
 {
   auto ctx_id = ctx.get()->get_slotidx();
   auto cur = get_fine_preemption_counters(dev);
+  
+  // If telemetry is not available for NPU3 yet
+  if (cur.empty())
+    return 0;
+  
   uint64_t fine_preemption_count;
   int index = -1;
   
@@ -324,11 +332,19 @@ io_test(device::id_type id, device* dev, int total_hwq_submit, int num_cmdlist,
   }
 
   bool preemption_enabled = false;
+  bool preemption_verification_enabled = false;
   std::vector<std::pair<int, uint64_t>> pre_cntrs;
   if (io_test_parameters.type == IO_TEST_FORCE_PREEMPTION) {
     // Enable force preemption and take snapshot of current fw counters before running any cmd.
     preemption_enabled = !force_fine_preemption(dev, true);
-    pre_cntrs = get_fine_preemption_counters(dev);
+    // Telemetry not available on AIE4, skip counter verification
+    auto device_id = device_query<query::pcie_device>(dev);
+    if (device_id == npu3_device_id || device_id == npu3_device_id1) {
+      preemption_verification_enabled = false;
+    } else {
+      preemption_verification_enabled = true;
+      pre_cntrs = get_fine_preemption_counters(dev);
+    }
   }
 
   // Submit commands and wait for results
@@ -342,11 +358,13 @@ io_test(device::id_type id, device* dev, int total_hwq_submit, int num_cmdlist,
   // Verify preemption counters
   if (preemption_enabled) {
     force_fine_preemption(dev, false);
-    auto delta = get_fine_preemption_counter_delta(dev, hwctx, pre_cntrs);
-    auto total_cmds = total_hwq_submit * num_cmdlist * cmds_per_list;
-    auto expected_preemption_count = total_cmds * bo_set[0]->get_preemption_checkpoints();
-    if (delta != expected_preemption_count)
-      throw std::runtime_error("Preemption counter does not match expectation!");
+    if (preemption_verification_enabled) {
+      auto delta = get_fine_preemption_counter_delta(dev, hwctx, pre_cntrs);
+      auto total_cmds = total_hwq_submit * num_cmdlist * cmds_per_list;
+      auto expected_preemption_count = total_cmds * bo_set[0]->get_preemption_checkpoints();
+      if (delta != expected_preemption_count)
+        throw std::runtime_error("Preemption counter does not match expectation!");
+    }
   }
 
   // Verify result
@@ -517,7 +535,7 @@ TEST_io_suspend_resume(device::id_type id, std::shared_ptr<device>& sdev, arg_ty
 void
 TEST_preempt_full_elf_io(device::id_type id, std::shared_ptr<device>& sdev, const std::vector<uint64_t>& arg)
 {
-  elf_io(id, sdev, arg, "yolo_fullelf_aximm.elf");
+  elf_io(id, sdev, arg, arg[2] ? "resnet50.elf" : "yolo_fullelf_aximm.elf");
 }
 
 void
