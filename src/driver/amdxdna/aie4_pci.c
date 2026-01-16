@@ -1705,7 +1705,7 @@ static int aie4_query_telemetry(struct amdxdna_client *client,
 	struct amdxdna_mgmt_dma_hdl *dma_hdl;
 	struct amdxdna_dev_hdl *ndev;
 	dma_addr_t dma_addr;
-	size_t aligned_sz;
+	size_t aligned_sz, size;
 	void *buff;
 	u32 type;
 	int ret;
@@ -1720,6 +1720,7 @@ static int aie4_query_telemetry(struct amdxdna_client *client,
 		return -EFAULT;
 	}
 
+	/* AIE4 firmware requires minimum 128KB buffer for telemetry */
 	ndev = xdna->dev_handle;
 	aligned_sz = args->buffer_size;
 
@@ -1750,8 +1751,6 @@ static int aie4_query_telemetry(struct amdxdna_client *client,
 		goto free_buf;
 	}
 
-	print_hex_dump_debug("telemetry: ", DUMP_PREFIX_OFFSET, 16, 4, buff,
-			     aligned_sz, false);
 	if (copy_to_user(u64_to_user_ptr(args->buffer), buff, args->buffer_size))
 		ret = -EFAULT;
 
