@@ -53,6 +53,7 @@ void TEST_io(device::id_type, std::shared_ptr<device>&, arg_type&);
 void TEST_io_timeout(device::id_type, std::shared_ptr<device>&, arg_type&);
 void TEST_io_gemm(device::id_type, std::shared_ptr<device>&, arg_type&);
 void TEST_async_error_io(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg);
+void TEST_async_error_aie4_io(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg);
 void TEST_async_error_multi(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg);
 void TEST_instr_invalid_addr_io(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg);
 void TEST_io_latency(device::id_type, std::shared_ptr<device>&, arg_type&);
@@ -712,7 +713,7 @@ std::vector<test_case> test_list {
   // get async error in multi thread before running any other tests
   // there may or may not be async error.
   test_case{ "get async error in multithread - INITIAL", {},
-    TEST_POSITIVE, dev_filter_is_aie2, TEST_async_error_multi, {false}
+    TEST_POSITIVE, dev_filter_xdna, TEST_async_error_multi, {false}
   },
   //test_case{ "non_xdna_userpf: query(rom_vbnv)", {},
   //  TEST_POSITIVE, dev_filter_not_xdna, TEST_query_userpf<query::rom_vbnv>, {}
@@ -771,6 +772,9 @@ std::vector<test_case> test_list {
   // Keep bad run before normal run to test recovery of hw ctx
   test_case{ "io test async error", {},
     TEST_POSITIVE, dev_filter_is_npu4, TEST_async_error_io, {}
+  },
+  test_case{ "io test async error (aie4)", {},
+    TEST_POSITIVE, dev_filter_is_aie4, TEST_async_error_aie4_io, {}
   },
   test_case{ "io test real kernel good run", {},
     TEST_POSITIVE, dev_filter_xdna, TEST_io, { IO_TEST_NORMAL_RUN, 1 }
@@ -922,7 +926,7 @@ std::vector<test_case> test_list {
   },
   // get async error in multi thread after async error has raised.
   test_case{ "get async error in multithread - HAS ASYNC ERROR", {},
-    TEST_POSITIVE, dev_filter_is_npu4, TEST_async_error_multi, {true}
+    TEST_POSITIVE, dev_filter_xdna, TEST_async_error_multi, {true}
   },
   test_case{ "gemm and debug BO", {},
     TEST_POSITIVE, dev_filter_is_npu4, TEST_io_gemm, {}
