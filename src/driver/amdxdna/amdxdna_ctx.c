@@ -205,9 +205,11 @@ int amdxdna_drm_config_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 
 	switch (args->param_type) {
 	case DRM_AMDXDNA_HWCTX_CONFIG_CU:
+	case DRM_AMDXDNA_HWCTX_CONFIG_SCHEDULING:
+	case DRM_AMDXDNA_HWCTX_CONFIG_DPM:
 		/* For those types that param_val is pointer */
 		if (buf_size > PAGE_SIZE) {
-			XDNA_ERR(xdna, "Config CU param buffer too large");
+			XDNA_ERR(xdna, "Config param buffer too large");
 			return -E2BIG;
 		}
 
@@ -224,6 +226,7 @@ int amdxdna_drm_config_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 	case DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF:
 	case DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF:
 	case DRM_AMDXDNA_HWCTX_CONFIG_OPCODE_TIMEOUT:
+	case DRM_AMDXDNA_HWCTX_CONFIG_PRIORITY_BAND:
 		/* For those types that param_val is a value */
 		buf = NULL;
 		buf_size = 0;
