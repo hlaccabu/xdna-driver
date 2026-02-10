@@ -77,6 +77,13 @@ static int psp_exec(struct psp_device *psp, u32 *reg_vals)
 	for (i = 1; i < PSP_NUM_IN_REGS; i++)
 		writel(reg_vals[i], PSP_REG(psp, i));
 
+	/* Read back from device to verify what actually landed in the registers */
+	dev_dbg(psp->dev, "PSP regs written: arg0=0x%08x arg1=0x%08x arg2=0x%08x",
+		reg_vals[PSP_ARG0_REG], reg_vals[PSP_ARG1_REG], reg_vals[PSP_ARG2_REG]);
+	dev_dbg(psp->dev, "PSP regs readback: arg0=0x%08x arg1=0x%08x arg2=0x%08x",
+		readl(PSP_REG(psp, PSP_ARG0_REG)), readl(PSP_REG(psp, PSP_ARG1_REG)),
+		readl(PSP_REG(psp, PSP_ARG2_REG)));
+
 	/* clear and set PSP INTR register to kick off */
 	writel(0, PSP_REG(psp, PSP_INTR_REG));
 	writel(PSP_NOTIFY_INTR, PSP_REG(psp, PSP_INTR_REG));
