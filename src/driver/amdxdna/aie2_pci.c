@@ -986,7 +986,7 @@ static int aie2_query_telemetry(struct amdxdna_client *client,
 	 */
 	size = max_t(size_t, args->buffer_size - offset, SZ_8K);
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl))
 		return PTR_ERR(dma_hdl);
 
@@ -1208,7 +1208,7 @@ static int aie2_query_ctx_status_array(struct amdxdna_client *client,
 	size_t size;
 
 	size = max_t(size_t, sizeof(*r), SZ_8K);
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate memory for app health");
 		return PTR_ERR(dma_hdl);
@@ -1440,7 +1440,7 @@ static int aie2_get_coredump(struct amdxdna_client *client, struct amdxdna_drm_g
 	}
 
 	list_size = max_t(size_t, num_bufs * sizeof(struct buffer_list), SZ_8K);
-	list_hdl = amdxdna_mgmt_buff_alloc(xdna, list_size, DMA_TO_DEVICE);
+	list_hdl = amdxdna_mgmt_buff_alloc(xdna, list_size, DMA_TO_DEVICE, false);
 	if (IS_ERR(list_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate buffer list");
 		ret = PTR_ERR(list_hdl);
@@ -1465,7 +1465,7 @@ static int aie2_get_coredump(struct amdxdna_client *client, struct amdxdna_drm_g
 	for (i = 0; i < num_bufs; i++) {
 		void *buf_addr;
 
-		data_hdls[i] = amdxdna_mgmt_buff_alloc(xdna, SZ_1M, DMA_FROM_DEVICE);
+		data_hdls[i] = amdxdna_mgmt_buff_alloc(xdna, SZ_1M, DMA_FROM_DEVICE, false);
 		if (IS_ERR(data_hdls[i])) {
 			XDNA_ERR(xdna, "Failed to allocate data buffer %d", i);
 			ret = PTR_ERR(data_hdls[i]);
@@ -1631,7 +1631,8 @@ static int aie2_aie_tile_read(struct amdxdna_client *client, struct amdxdna_drm_
 
 	/* Memory read: size > 4 bytes, use DMA buffer */
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, max_t(u32, access.size, SZ_8K), DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, max_t(u32, access.size, SZ_8K),
+					  DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl)) {
 		ret = PTR_ERR(dma_hdl);
 		XDNA_ERR(xdna, "Failed to allocate DMA buffer, ret %d", ret);
@@ -1773,7 +1774,8 @@ static int aie2_aie_tile_write(struct amdxdna_client *client, struct amdxdna_drm
 
 	/* Memory write: size > 4 bytes, use DMA buffer */
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, max_t(u32, access.size, SZ_8K), DMA_TO_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, max_t(u32, access.size, SZ_8K),
+					  DMA_TO_DEVICE, false);
 	if (IS_ERR(dma_hdl)) {
 		ret = PTR_ERR(dma_hdl);
 		XDNA_ERR(xdna, "Failed to allocate DMA buffer, ret %d", ret);

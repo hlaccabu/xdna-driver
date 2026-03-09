@@ -453,7 +453,7 @@ static int aie2_telemetry(struct seq_file *m, u32 type)
 	void *buff;
 	int ret;
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl))
 		return PTR_ERR(dma_hdl);
 
@@ -534,7 +534,7 @@ static int aie2_get_app_health_show(struct seq_file *m, void *unused)
 	int ret;
 
 	size = max_t(size_t, sizeof(*report), SZ_8K);
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl))
 		return PTR_ERR(dma_hdl);
 

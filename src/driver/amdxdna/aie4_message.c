@@ -190,7 +190,7 @@ int aie4_query_aie_status(struct amdxdna_dev_hdl *ndev, char __user *buf,
 		return -EFAULT;
 	}
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, size, DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl))
 		return PTR_ERR(dma_hdl);
 

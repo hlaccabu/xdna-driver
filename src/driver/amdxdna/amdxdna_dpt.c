@@ -318,7 +318,7 @@ static int amdxdna_fw_log_init(struct amdxdna_dev *xdna, u8 log_level)
 	if (!log_hdl)
 		return -ENOMEM;
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, fw_log_size, DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, fw_log_size, DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate FW log buffer of size: 0x%llx", fw_log_size);
 		ret = PTR_ERR(dma_hdl);
@@ -570,7 +570,7 @@ static int amdxdna_fw_trace_init(struct amdxdna_dev *xdna, u32 categories)
 	if (!trace_hdl)
 		return -ENOMEM;
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, fw_trace_size, DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, fw_trace_size, DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate FW trace buffer of size: 0x%llx", fw_trace_size);
 		ret = PTR_ERR(dma_hdl);

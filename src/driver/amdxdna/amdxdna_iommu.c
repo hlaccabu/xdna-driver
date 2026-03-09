@@ -8,10 +8,10 @@
 #ifdef HAVE_iommu_paging_domain_alloc_flags
 /* IOMMU_HWPT_ALLOC_PASID is defined in uiommufd.h */
 #include <uapi/linux/iommufd.h>
-#else
-/* used GENMASK() to define iommu iova upper limit */
-#include <linux/bits.h>
 #endif
+/* used GENMASK() to define iommu iova upper limit when geometry not available */
+#include <linux/bits.h>
+#include <linux/sizes.h>
 
 #include "amdxdna_gem.h"
 #include "amdxdna_pci_drv.h"
@@ -22,21 +22,27 @@ MODULE_PARM_DESC(force_iova, "Force use IOVA (Default false)");
 
 static struct iova *amdxdna_iommu_alloc_iova(struct amdxdna_dev *xdna,
 					     size_t size,
-					     dma_addr_t *dma_addr)
+					     dma_addr_t *dma_addr,
+					     bool prefer_low)
 {
-	unsigned long shift, end;
+	unsigned long shift, end, limit_pfn, start_pfn;
 	struct iova *iova;
 
 #ifdef HAVE_iommu_paging_domain_alloc_flags
 	end = xdna->domain->geometry.aperture_end;
 #else
-	/* xdna PD_MODE_V2 device uses a 47-bit IOVA address space (0 to GENMASK(46, 0)) */
 	end = GENMASK(46, 0);
 #endif
 	shift = iova_shift(&xdna->iovad);
 	size = iova_align(&xdna->iovad, size);
+	limit_pfn = end >> shift;
+	if (prefer_low) {
+		/* Allocator is top-down; cap limit so we get a low IOVA (e.g. work buffer). */
+		start_pfn = xdna->iovad.start_pfn;
+		limit_pfn = min(limit_pfn, start_pfn + (size >> shift));
+	}
 
-	iova = alloc_iova(&xdna->iovad, size >> shift, end >> shift, true);
+	iova = alloc_iova(&xdna->iovad, size >> shift, limit_pfn, true);
 	if (!iova)
 		return ERR_PTR(-ENOMEM);
 
@@ -61,7 +67,7 @@ int amdxdna_iommu_map_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo)
 		return PTR_ERR(sgt);
 	}
 
-	iova = amdxdna_iommu_alloc_iova(xdna, abo->mem.size, &dma_addr);
+	iova = amdxdna_iommu_alloc_iova(xdna, abo->mem.size, &dma_addr, false);
 	if (IS_ERR(iova)) {
 		XDNA_ERR(xdna, "Alloc iova failed, ret %ld", PTR_ERR(iova));
 		return PTR_ERR(iova);
@@ -101,35 +107,66 @@ void amdxdna_iommu_unmap_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *ab
 
 void *amdxdna_iommu_alloc(struct amdxdna_dev *xdna, size_t size, dma_addr_t *dma_addr)
 {
+	return amdxdna_iommu_alloc_prefer(xdna, size, dma_addr, false);
+}
+
+void *amdxdna_iommu_alloc_prefer(struct amdxdna_dev *xdna, size_t size, dma_addr_t *dma_addr,
+				 bool prefer_low)
+{
 	struct iova *iova;
 	void *cpu_addr;
+	size_t aligned_size;
 	int ret;
 
 	if (!xdna->domain)
 		return ERR_PTR(-EINVAL);
 
-	iova = amdxdna_iommu_alloc_iova(xdna, size, dma_addr);
-	if (IS_ERR(iova)) {
-		XDNA_ERR(xdna, "Alloc iova failed, ret %ld", PTR_ERR(iova));
-		return iova;
+	aligned_size = iova_align(&xdna->iovad, size);
+
+	/* Use reserved low IOVA for DRAM work buffer if size matches. */
+	if (prefer_low && xdna->reserved_work_iova && xdna->reserved_work_size == aligned_size) {
+		*dma_addr = xdna->reserved_work_iova;
+		xdna->reserved_work_iova = 0;
+		xdna->reserved_work_size = 0;
+	} else {
+		iova = amdxdna_iommu_alloc_iova(xdna, size, dma_addr, prefer_low);
+		if (IS_ERR(iova)) {
+			XDNA_ERR(xdna, "Alloc iova failed, ret %ld", PTR_ERR(iova));
+			return iova;
+		}
 	}
 
 	cpu_addr = (void *)__get_free_pages(GFP_KERNEL, get_order(size));
 	if (!cpu_addr) {
 		ret = -ENOMEM;
+		if (prefer_low && !xdna->reserved_work_iova) {
+			/* We consumed the reserved IOVA; put it back by re-allocating. */
+			xdna->reserved_work_iova = *dma_addr;
+			xdna->reserved_work_size = aligned_size;
+		}
 		goto free_iova;
 	}
 
 	ret = iommu_map(xdna->domain, *dma_addr, virt_to_phys(cpu_addr),
-			iova_align(&xdna->iovad, size),
-			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
-	if (ret)
+			aligned_size, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+	if (ret) {
+		if (prefer_low && !xdna->reserved_work_iova) {
+			xdna->reserved_work_iova = *dma_addr;
+			xdna->reserved_work_size = aligned_size;
+		}
 		goto free_iova;
+	}
 
 	return cpu_addr;
 
 free_iova:
-	__free_iova(&xdna->iovad, iova);
+	if (prefer_low && xdna->reserved_work_iova) {
+		/* Reserved path: no iova to free here, already in tree. */
+		free_pages((unsigned long)cpu_addr, get_order(size));
+		return ERR_PTR(ret);
+	}
+	free_iova(&xdna->iovad, iova_pfn(&xdna->iovad, *dma_addr));
+	free_pages((unsigned long)cpu_addr, get_order(size));
 	return ERR_PTR(ret);
 }
 
@@ -143,11 +180,15 @@ void amdxdna_iommu_free(struct amdxdna_dev *xdna, size_t size,
 
 int amdxdna_iommu_init(struct amdxdna_dev *xdna)
 {
-	unsigned long order;
+	unsigned long order, shift, npages, limit_pfn, start_pfn;
+	struct iova *iova;
 	int ret;
 
 	if (!force_iova)
 		return 0;
+
+	xdna->reserved_work_iova = 0;
+	xdna->reserved_work_size = 0;
 
 	xdna->group = iommu_group_get(xdna->ddev.dev);
 	if (!xdna->group) {
@@ -156,15 +197,22 @@ int amdxdna_iommu_init(struct amdxdna_dev *xdna)
 	}
 
 #ifdef HAVE_iommu_paging_domain_alloc_flags
-	xdna->domain = iommu_paging_domain_alloc_flags(xdna->ddev.dev, IOMMU_HWPT_ALLOC_PASID);
+	/* Force IOVA: single domain for IOVA only (no PASID). Use 0, not IOMMU_HWPT_ALLOC_PASID. */
+	xdna->domain = iommu_paging_domain_alloc_flags(xdna->ddev.dev, 0);
+	if (IS_ERR(xdna->domain) && PTR_ERR(xdna->domain) == -EOPNOTSUPP) {
+		/* IOMMU doesn't support paging domain with flags; try alloc without flags. */
+#ifdef HAVE_iommu_paging_domain_alloc
+		xdna->domain = iommu_paging_domain_alloc(xdna->ddev.dev);
+#endif
+	}
 #elif defined(HAVE_iommu_paging_domain_alloc)
 	xdna->domain = iommu_paging_domain_alloc(xdna->ddev.dev);
 #else
-	xdna->domain = iommu_domain_alloc(xdna->ddev.dev->bus);
+	xdna->domain = ERR_PTR(-EOPNOTSUPP);
 #endif
 	if (IS_ERR(xdna->domain)) {
-		XDNA_ERR(xdna, "Failed to alloc iommu domain");
 		ret = PTR_ERR(xdna->domain);
+		XDNA_ERR(xdna, "Failed to alloc iommu domain, ret %d", ret);
 		goto put_group;
 	}
 
@@ -173,11 +221,25 @@ int amdxdna_iommu_init(struct amdxdna_dev *xdna)
 		goto free_domain;
 
 	order = __ffs(xdna->domain->pgsize_bitmap);
-	init_iova_domain(&xdna->iovad, 1UL << order, 0);
+	/* Start IOVA at 4MB so first allocation (e.g. DRAM work buffer) is not at 0. */
+	init_iova_domain(&xdna->iovad, 1UL << order, SZ_4M >> order);
 
 	ret = iommu_attach_group(xdna->domain, xdna->group);
 	if (ret)
 		goto put_iova;
+
+	/* Reserve low IOVA for DRAM work buffer so it always gets a firmware-accepted address. */
+	shift = iova_shift(&xdna->iovad);
+	xdna->reserved_work_size = iova_align(&xdna->iovad, SZ_4M);
+	npages = xdna->reserved_work_size >> shift;
+	start_pfn = xdna->iovad.start_pfn;
+	limit_pfn = start_pfn + npages;
+	iova = alloc_iova(&xdna->iovad, npages, limit_pfn, true);
+	if (iova) {
+		xdna->reserved_work_iova = iova_dma_addr(&xdna->iovad, iova);
+		XDNA_DBG(xdna, "Reserved work buffer IOVA 0x%llx size 0x%zx",
+			 (u64)xdna->reserved_work_iova, xdna->reserved_work_size);
+	}
 
 	return 0;
 

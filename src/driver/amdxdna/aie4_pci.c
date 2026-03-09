@@ -709,7 +709,7 @@ static int aie4_alloc_work_buffer(struct amdxdna_dev_hdl *ndev)
 	}
 
 	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, AIE4_MPNPUFW_DRAM_WORK_BUFFER_MIN_SIZE,
-					  DMA_FROM_DEVICE);
+					  DMA_FROM_DEVICE, true);
 	if (IS_ERR(dma_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate MPNPU buffer of size: 0x%x",
 			 AIE4_MPNPUFW_DRAM_WORK_BUFFER_MIN_SIZE);
@@ -971,8 +971,23 @@ int aie4_create_context(struct amdxdna_dev_hdl *ndev, struct amdxdna_ctx *ctx)
 		req.pasid.raw = 0;
 #endif
 
-	req.hsa_addr_high = upper_32_bits(amdxdna_gem_dev_addr(nctx->umq_bo));
-	req.hsa_addr_low = lower_32_bits(amdxdna_gem_dev_addr(nctx->umq_bo));
+	{
+		u64 hsa_addr = amdxdna_gem_dev_addr(nctx->umq_bo);
+
+		req.hsa_addr_high = upper_32_bits(hsa_addr);
+		req.hsa_addr_low = lower_32_bits(hsa_addr);
+		XDNA_INFO(xdna, "create_hw_context hsa_addr 0x%llx (UMQ BO dev_addr)",
+			  hsa_addr);
+#ifdef AMDXDNA_DEVEL
+		if (amdxdna_iova_enabled(xdna) &&
+		    (hsa_addr == 0 || hsa_addr == AMDXDNA_INVALID_ADDR)) {
+			XDNA_ERR(xdna, "UMQ BO has invalid dev_addr 0x%llx for IOVA mode",
+				 hsa_addr);
+			ret = -EINVAL;
+			goto done;
+		}
+#endif
+	}
 
 	req.priority_band = ctx->qos.priority;
 
@@ -1781,7 +1796,7 @@ static int aie4_query_telemetry(struct amdxdna_client *client,
 		return -ENOSPC;
 	}
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, aligned_sz, DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, aligned_sz, DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl))
 		return PTR_ERR(dma_hdl);
 
@@ -2192,7 +2207,7 @@ static int aie4_get_coredump(struct amdxdna_client *client, struct amdxdna_drm_g
 	}
 
 	list_size = max_t(size_t, num_bufs * sizeof(struct coredump_buffer_list_entry), SZ_8K);
-	list_hdl = amdxdna_mgmt_buff_alloc(xdna, list_size, DMA_TO_DEVICE);
+	list_hdl = amdxdna_mgmt_buff_alloc(xdna, list_size, DMA_TO_DEVICE, false);
 	if (IS_ERR(list_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate buffer list");
 		ret = PTR_ERR(list_hdl);
@@ -2217,7 +2232,7 @@ static int aie4_get_coredump(struct amdxdna_client *client, struct amdxdna_drm_g
 	for (i = 0; i < num_bufs; i++) {
 		void *buf_addr;
 
-		data_hdls[i] = amdxdna_mgmt_buff_alloc(xdna, SZ_1M, DMA_FROM_DEVICE);
+		data_hdls[i] = amdxdna_mgmt_buff_alloc(xdna, SZ_1M, DMA_FROM_DEVICE, false);
 		if (IS_ERR(data_hdls[i])) {
 			XDNA_ERR(xdna, "Failed to allocate data buffer %d", i);
 			ret = PTR_ERR(data_hdls[i]);
@@ -2384,7 +2399,8 @@ static int aie4_aie_tile_read(struct amdxdna_client *client, struct amdxdna_drm_
 
 	/* Memory read: size > 4 bytes, use DMA buffer */
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, max_t(u32, access.size, SZ_8K), DMA_FROM_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, max_t(u32, access.size, SZ_8K),
+					  DMA_FROM_DEVICE, false);
 	if (IS_ERR(dma_hdl)) {
 		ret = PTR_ERR(dma_hdl);
 		XDNA_ERR(xdna, "Failed to allocate DMA buffer, ret %d", ret);
@@ -2527,7 +2543,8 @@ static int aie4_aie_tile_write(struct amdxdna_client *client, struct amdxdna_drm
 
 	/* Memory write: size > 4 bytes, use DMA buffer */
 
-	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, max_t(u32, access.size, SZ_8K), DMA_TO_DEVICE);
+	dma_hdl = amdxdna_mgmt_buff_alloc(xdna, max_t(u32, access.size, SZ_8K),
+					  DMA_TO_DEVICE, false);
 	if (IS_ERR(dma_hdl)) {
 		ret = PTR_ERR(dma_hdl);
 		XDNA_ERR(xdna, "Failed to allocate DMA buffer, ret %d", ret);

@@ -169,6 +169,9 @@ struct amdxdna_dev {
 	struct iommu_group		*group;
 	struct iommu_domain		*domain;
 	struct iova_domain		iovad;
+	/* Reserved low IOVA for DRAM work buffer (set at init, consumed once). */
+	dma_addr_t			reserved_work_iova;
+	size_t				reserved_work_size;
 };
 
 struct amdxdna_stats {
@@ -238,6 +241,8 @@ void amdxdna_iommu_fini(struct amdxdna_dev *xdna);
 int amdxdna_iommu_map_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo);
 void amdxdna_iommu_unmap_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo);
 void *amdxdna_iommu_alloc(struct amdxdna_dev *xdna, size_t size, dma_addr_t *dma_addr);
+void *amdxdna_iommu_alloc_prefer(struct amdxdna_dev *xdna, size_t size, dma_addr_t *dma_addr,
+				 bool prefer_low);
 void amdxdna_iommu_free(struct amdxdna_dev *xdna, size_t size,
 			void *cpu_addr, dma_addr_t dma_addr);
 static inline bool amdxdna_iova_enabled(struct amdxdna_dev *xdna)

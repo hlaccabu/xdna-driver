@@ -45,7 +45,8 @@ static int amdxdna_mgmt_buff_validate(struct amdxdna_dev *xdna, dma_addr_t addr,
 }
 
 struct amdxdna_mgmt_dma_hdl *amdxdna_mgmt_buff_alloc(struct amdxdna_dev *xdna, size_t size,
-						     enum dma_data_direction dir)
+						     enum dma_data_direction dir,
+						     bool prefer_low_iova)
 {
 	struct amdxdna_mgmt_dma_hdl *dma_hdl;
 
@@ -83,8 +84,8 @@ struct amdxdna_mgmt_dma_hdl *amdxdna_mgmt_buff_alloc(struct amdxdna_dev *xdna, s
 		dma_hdl->aligned_size = SZ_4M;
 
 	if (amdxdna_iova_enabled(xdna)) {
-		dma_hdl->vaddr = amdxdna_iommu_alloc(xdna, dma_hdl->aligned_size,
-						     &dma_hdl->dma_hdl);
+		dma_hdl->vaddr = amdxdna_iommu_alloc_prefer(xdna, dma_hdl->aligned_size,
+							    &dma_hdl->dma_hdl, prefer_low_iova);
 		if (IS_ERR(dma_hdl->vaddr)) {
 			int ret = PTR_ERR(dma_hdl->vaddr);
 

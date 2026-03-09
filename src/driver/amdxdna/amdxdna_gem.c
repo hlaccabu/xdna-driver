@@ -439,8 +439,23 @@ u64 amdxdna_gem_dev_addr(struct amdxdna_gem_obj *abo)
 		return abo->client->xdna->dev_info->dev_mem_base;
 	if (abo->type == AMDXDNA_BO_DEV)
 		return abo->mm_node.start;
-	if (iommu_mode == AMDXDNA_IOMMU_NO_PASID)
+	if (iommu_mode == AMDXDNA_IOMMU_NO_PASID) {
+#ifdef AMDXDNA_DEVEL
+		/*
+		 * On-demand map if BO was not mapped at create or has a sentinel/invalid
+		 * address (e.g. 0xffffffffffff0000). Firmware expects a valid IOVA.
+		 */
+		if (abo->mem.dma_addr == AMDXDNA_INVALID_ADDR || abo->mem.dma_addr == 0 ||
+		    abo->mem.dma_addr >= 0xffff000000000000ULL) {
+			int ret = amdxdna_bo_dma_map(abo);
+
+			if (ret)
+				XDNA_ERR(to_xdna_dev(to_gobj(abo)->dev),
+					 "BO not DMA mapped, dev_addr may be invalid");
+		}
+#endif
 		return abo->mem.dma_addr;
+	}
 	return amdxdna_gem_uva(abo);
 }
 

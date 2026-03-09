@@ -381,7 +381,7 @@ int aie2_error_async_events_alloc(struct amdxdna_dev_hdl *ndev)
 
 	for (i = 0; i < events->event_cnt; i++) {
 		e = &events->event[i];
-		e->dma_hdl = amdxdna_mgmt_buff_alloc(xdna, ASYNC_BUF_SIZE, DMA_FROM_DEVICE);
+		e->dma_hdl = amdxdna_mgmt_buff_alloc(xdna, ASYNC_BUF_SIZE, DMA_FROM_DEVICE, false);
 		if (IS_ERR(e->dma_hdl)) {
 			ret = PTR_ERR(e->dma_hdl);
 			goto free_buf;
