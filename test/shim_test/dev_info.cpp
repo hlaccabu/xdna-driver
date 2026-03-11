@@ -75,7 +75,7 @@ binary_info binary_infos[] = {
     .device = npu3_device_id,
     .revision_id = npu_any_revision_id,
     .ip_name2idx = {
-      { "DPU:dpu", {0xffffffff} },
+      { "DPU:move_memtiles", {0xffffffff} },
     },
     .path = "local_shim_test_data/npu3/bad/bad_timeout.elf",
     .flow = FULL_ELF,
@@ -115,7 +115,7 @@ binary_info binary_infos[] = {
     .device = npu3_device_id1,
     .revision_id = npu_any_revision_id,
     .ip_name2idx = {
-      { "DPU:dpu", {0xffffffff} },
+      { "DPU:move_memtiles", {0xffffffff} },
     },
     .path = "local_shim_test_data/npu3a/bad/bad_timeout.elf",
     .flow = FULL_ELF,

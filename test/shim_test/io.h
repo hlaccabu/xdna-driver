@@ -174,6 +174,7 @@ public:
   verify_result() override;
 
 private:
+  bool m_is_full_elf = false;  /* true = FULL_ELF (AIE4 bad_timeout.elf), false = PARTIAL_ELF (NPU4) */
   uint32_t m_expect_txn_op_idx;
   uint32_t m_expect_cmd_status;
 };
@@ -249,8 +250,8 @@ private:
   bool m_is_full_elf = false;
 };
 
-/** Create a BO set appropriate for the device (legacy ddr_range.txt vs ELF).
- *  AIE4 (NPU3) uses elf_full_io_test_bo_set, others use io_test_bo_set.
+/** Create a BO set appropriate for the device and tag.
+ *  LEGACY -> io_test_bo_set; PARTIAL_ELF -> elf_io_test_bo_set; FULL_ELF -> elf_full_io_test_bo_set.
  */
 std::unique_ptr<io_test_bo_set_base> create_bo_set_for_device(device* dev, bool use_ubuf = false,
                                                                const char* tag = nullptr);
