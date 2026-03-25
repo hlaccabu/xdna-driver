@@ -20,6 +20,8 @@
 #include "amdxdna_dpt.h"
 #include "amdxdna_gem.h"
 
+struct gen_pool;
+
 #define MAX_MEM_REGIONS	8
 
 #define XDNA_INFO(xdna, fmt, args...)	dev_info((xdna)->ddev.dev, fmt, ##args)
@@ -165,6 +167,16 @@ struct amdxdna_dev {
 	struct workqueue_struct		*notifier_wq;
 
 	struct device			*cma_region_devs[MAX_MEM_REGIONS];
+#ifdef AMDXDNA_DEVEL
+	/*
+	 * One dma_alloc_coherent chunk + gen_pool slices for SHARE/CMD BOs so all
+	 * host-visible buffers share the same bus-address window (CERT completion).
+	 */
+	struct gen_pool			*unified_bo_pool;
+	void				*unified_bo_vaddr;
+	dma_addr_t			unified_bo_dma;
+	size_t				unified_bo_sz;
+#endif
 
 	struct iommu_group		*group;
 	struct iommu_domain		*domain;

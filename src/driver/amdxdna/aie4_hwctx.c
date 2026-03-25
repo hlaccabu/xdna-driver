@@ -3,8 +3,9 @@
  * Copyright (C) 2024-2026, Advanced Micro Devices, Inc.
  */
 #include <linux/pm_runtime.h>
-#include <drm/drm_syncobj.h>
+#include <linux/dma-mapping.h>
 #include <drm/drm_cache.h>
+#include <drm/drm_syncobj.h>
 
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
@@ -23,6 +24,24 @@
 int kernel_mode_submission = 1;
 module_param(kernel_mode_submission, int, 0600);
 MODULE_PARM_DESC(kernel_mode_submission, "I/O submission, 0 - by user, 1 by driver (default)");
+
+/*
+ * Without periodic re-poll, wait_event() only re-runs check_cmd_done() after MSI-X
+ * wakeups; if those are missing, read_index advances on device but host never notices
+ * → exec buf timeout. umq_completion_poll_ms=0 uses IRQ wakeups only (for debug).
+ */
+static unsigned int aie4_umq_completion_poll_ms = 25;
+module_param_named(umq_completion_poll_ms, aie4_umq_completion_poll_ms, uint, 0644);
+MODULE_PARM_DESC(umq_completion_poll_ms,
+		 "re-poll UMQ read_index every N ms while waiting (0 = IRQ wakeups only, default 25)");
+
+/* dma_addr stays AMDXDNA_INVALID_ADDR (~0) when not mapped; never use !dma_addr for that. */
+static inline bool aie4_bo_has_bus_addr(struct amdxdna_gem_obj *bo)
+{
+	u64 a = bo->mem.dma_addr;
+
+	return bo && a && a != AMDXDNA_INVALID_ADDR;
+}
 
 static int aie4_alloc_resource(struct amdxdna_ctx *ctx)
 {
@@ -155,11 +174,17 @@ static int aie4_ctx_umq_init(struct amdxdna_ctx *ctx)
 	qhdr->data_address = amdxdna_gem_dev_addr(umq_bo) + sizeof(*qhdr);
 	for (i = 0; i < CTX_MAX_CMDS; i++)
 		priv->umq_pkts[i].pkt_header.common_header.opcode = OPCODE_EXEC_BUF;
+	/* Leaf indirect exec_buf: distribute=1, indirect=0 (see shim init_indirect_buf; memset clears indirect). */
 	for (i = 0; i < CTX_MAX_CMDS * HSA_MAX_LEVEL1_INDIRECT_ENTRIES; i++) {
 		priv->umq_indirect_pkts[i].header.opcode = OPCODE_EXEC_BUF;
 		priv->umq_indirect_pkts[i].header.count = sizeof(struct exec_buf);
 		priv->umq_indirect_pkts[i].header.distribute = 1;
 	}
+
+	/* Push initial UMQ (header, slots, indirect templates) to device once. */
+	if (aie4_bo_has_bus_addr(umq_bo))
+		dma_sync_single_for_device(xdna->ddev.dev, umq_bo->mem.dma_addr, umq_sz,
+					   DMA_TO_DEVICE);
 	return 0;
 }
 
@@ -348,8 +373,72 @@ done:
 	job_done(job);
 }
 
+/*
+ * VE2/shim UMQ path uses targeted dma_sync on queue regions. Syncing the entire UMQ
+ * BO (header + packets + indirect) for every submit can break index visibility on
+ * some ARM64 / non-coherent DMA paths.
+ */
+/* Header + packet ring + indirect arena (matches minimum UMQ BO layout). */
+static void aie4_umq_sync_working_region_for_device(struct amdxdna_ctx *ctx)
+{
+	struct amdxdna_gem_obj *bo = ctx->priv->umq_bo;
+	struct device *dev = ctx->client->xdna->ddev.dev;
+	const size_t pkts_sz = CTX_MAX_CMDS * sizeof(struct host_queue_packet);
+	const size_t ind_sz = CTX_MAX_CMDS * HSA_MAX_LEVEL1_INDIRECT_ENTRIES *
+			      sizeof(struct host_indirect_packet_data);
+	size_t nbytes = sizeof(struct host_queue_header) + pkts_sz + ind_sz;
+
+	if (!kernel_mode_submission || !bo || !aie4_bo_has_bus_addr(bo))
+		return;
+	if (nbytes > bo->mem.size)
+		nbytes = bo->mem.size;
+	dma_sync_single_for_device(dev, bo->mem.dma_addr, nbytes, DMA_TO_DEVICE);
+}
+
+/*
+ * After the device updates UMQ (read_index etc.), invalidate the CPU's view.
+ * Use the full working region: header-only sync missed updates on some cache
+ * configurations; if dma_addr was never set (~0), dma_sync_single_* was bogus.
+ */
+static void aie4_umq_sync_working_region_for_cpu(struct amdxdna_ctx *ctx)
+{
+	struct amdxdna_gem_obj *bo = ctx->priv->umq_bo;
+	struct device *dev = ctx->client->xdna->ddev.dev;
+	struct amdxdna_ctx_priv *priv = ctx->priv;
+	const size_t pkts_sz = CTX_MAX_CMDS * sizeof(struct host_queue_packet);
+	const size_t ind_sz = CTX_MAX_CMDS * HSA_MAX_LEVEL1_INDIRECT_ENTRIES *
+			      sizeof(struct host_indirect_packet_data);
+	size_t nbytes = sizeof(struct host_queue_header) + pkts_sz + ind_sz;
+	void *base;
+
+	if (!kernel_mode_submission || !bo || !priv->umq_pkts)
+		return;
+	if (nbytes > bo->mem.size)
+		nbytes = bo->mem.size;
+
+	if (aie4_bo_has_bus_addr(bo)) {
+		dma_sync_single_for_cpu(dev, bo->mem.dma_addr, nbytes, DMA_FROM_DEVICE);
+	} else {
+		base = (char *)priv->umq_pkts - sizeof(struct host_queue_header);
+		drm_clflush_virt_range(base, nbytes);
+	}
+	rmb();
+}
+
+static void aie4_bo_sync_for_device(struct amdxdna_ctx *ctx, struct amdxdna_gem_obj *bo)
+{
+	struct device *dev = ctx->client->xdna->ddev.dev;
+
+	if (!bo || !bo->mem.size || !aie4_bo_has_bus_addr(bo))
+		return;
+	dma_sync_single_for_device(dev, bo->mem.dma_addr, bo->mem.size,
+				   DMA_BIDIRECTIONAL);
+}
+
 static inline void ring_doorbell(struct amdxdna_ctx *ctx)
 {
+	/* Ensure UMQ and doorbell write order visible to NPU (ARM64 / PCIe). */
+	wmb();
 	writel(0, ctx->priv->doorbell_addr);
 }
 
@@ -360,9 +449,13 @@ static inline bool valid_queue_index(u64 read, u64 write, u32 capacity)
 
 static inline u64 get_read_index(struct amdxdna_ctx *ctx)
 {
-	u64 wi = READ_ONCE(*ctx->priv->umq_write_index);
-	u64 ri = READ_ONCE(*ctx->priv->umq_read_index);
+	u64 wi, ri;
 	struct amdxdna_dev *xdna = ctx->client->xdna;
+
+	/* Invalidate UMQ working region so CPU sees CERT read/write_index updates. */
+	aie4_umq_sync_working_region_for_cpu(ctx);
+	wi = READ_ONCE(*ctx->priv->umq_write_index);
+	ri = READ_ONCE(*ctx->priv->umq_read_index);
 
 	/*
 	 * CERT cannot update read index atomically. Driver may read half-updated
@@ -398,7 +491,6 @@ static inline bool check_cmd_done(struct amdxdna_ctx *ctx, u64 seq)
 		return true;
 
 	ri = get_read_index(ctx);
-	XDNA_DBG(ctx->client->xdna, "checking if read_idx %lld > seq %lld", ri, seq);
 	return ri > seq;
 }
 
@@ -431,11 +523,22 @@ static void aie4_ctx_put_cert_comp(struct cert_comp *cert_comp)
 static inline int wait_till_seq_completed(struct amdxdna_ctx *ctx, u64 seq)
 {
 	struct cert_comp *cert_comp = aie4_ctx_get_cert_comp(ctx);
+	unsigned long poll_jifs;
 
 	if (!cert_comp)
 		return -EAGAIN;
 
-	wait_event(cert_comp->waitq, check_cmd_done(ctx, seq));
+	if (!aie4_umq_completion_poll_ms) {
+		wait_event(cert_comp->waitq, check_cmd_done(ctx, seq));
+	} else {
+		poll_jifs = msecs_to_jiffies(aie4_umq_completion_poll_ms);
+		if (!poll_jifs)
+			poll_jifs = 1;
+		while (!check_cmd_done(ctx, seq))
+			wait_event_timeout(cert_comp->waitq, check_cmd_done(ctx, seq),
+					   poll_jifs);
+	}
+
 	aie4_ctx_put_cert_comp(cert_comp);
 	return (ctx->priv->status != CTX_STATE_CONNECTED) ? -EAGAIN : 0;
 }
@@ -485,7 +588,31 @@ static void job_worker(struct work_struct *work)
 		trace_amdxdna_debug_point(ctx->name, job->seq, "job complete");
 
 		if (get_read_index(ctx) > job->seq) {
-			/* Job is completed (be it success or failure) normally by CERT. */
+			/*
+			 * CERT may bump read_index before the exec-buf ERT header is visible
+			 * on the host; dma_sync + short spin improves coherency before we read state.
+			 */
+			if (aie4_bo_has_bus_addr(job->cmd_bo) && job->cmd_bo->mem.size) {
+				struct device *dev = ctx->client->xdna->ddev.dev;
+				int tries = 0;
+
+				while (tries++ < 2000 &&
+				       amdxdna_cmd_get_state(job->cmd_bo) == ERT_CMD_STATE_NEW) {
+					dma_sync_single_for_cpu(dev, job->cmd_bo->mem.dma_addr,
+								job->cmd_bo->mem.size,
+								DMA_BIDIRECTIONAL);
+					usleep_range(50, 150);
+				}
+			}
+			/*
+			 * KMS: shim requires exec-buf ERT state >= COMPLETED when the fence
+			 * signals. If still NEW, normalize so user space does not get EINVAL.
+			 */
+			if (job->cmd_bo &&
+			    amdxdna_cmd_get_state(job->cmd_bo) == ERT_CMD_STATE_NEW) {
+				amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_COMPLETED);
+				wmb();
+			}
 			job_complete(job);
 		/* Pairs with smp_store_release in aie4_ctx_cache_health_report. */
 		} else if (smp_load_acquire(&ctx->priv->cached_ctx_error_valid)) {
@@ -721,6 +848,7 @@ static int submit_one_cmd(struct amdxdna_ctx *ctx,
 		return -EINVAL;
 	}
 
+
 	mutex_unlock(&ctx->io_lock);
 	ret = wait_till_hsa_not_full(ctx);
 	mutex_lock(&ctx->io_lock);
@@ -739,8 +867,15 @@ static int submit_one_cmd(struct amdxdna_ctx *ctx,
 		last_of_chain ? CHAIN_FLG_LAST_CMD : CHAIN_FLG_NOT_LAST_CMD;
 	pkt->pkt_header.completion_signal = amdxdna_gem_dev_addr(cmd_abo);
 	pkt->pkt_header.completion_signal += offsetof(struct amdxdna_cmd, header);
-	pkt->pkt_header.common_header.reserved = 0x0; /* Remove after update CERT. */
+	pkt->pkt_header.common_header.reserved = 0;
+
 	*seq = publish_cmd(ctx);
+	/* After write_index is visible in CPU memory, flush whole UMQ working set (see ve2). */
+	aie4_umq_sync_working_region_for_device(ctx);
+
+	/* Exec buffer for device read (instruction BO is user-owned; do not dma_sync on raw IOVA). */
+	aie4_bo_sync_for_device(ctx, cmd_abo);
+
 	/*aie4_ctx_umq_dump(ctx);*/
 	ring_doorbell(ctx);
 	XDNA_DBG(xdna, "Submitted one cmd, %s seq %lld", ctx->name, *seq);

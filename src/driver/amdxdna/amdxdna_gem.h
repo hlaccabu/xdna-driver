@@ -12,6 +12,8 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <linux/hmm.h>
 
+struct amdxdna_dev;
+
 struct amdxdna_mem {
 	void				*kva;
 	size_t				size;
@@ -88,5 +90,7 @@ int amdxdna_drm_sync_bo_ioctl(struct drm_device *dev, void *data, struct drm_fil
 void *amdxdna_gem_vmap(struct amdxdna_gem_obj *abo);
 u64 amdxdna_gem_uva(struct amdxdna_gem_obj *abo);
 u64 amdxdna_gem_dev_addr(struct amdxdna_gem_obj *abo);
+
+void amdxdna_gem_unified_pool_fini(struct amdxdna_dev *xdna);
 
 #endif /* _AMDXDNA_GEM_H_ */

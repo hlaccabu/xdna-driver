@@ -11,6 +11,7 @@
 #include <linux/pfn.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+#include <linux/genalloc.h>
 #include <drm/drm_cache.h>
 
 #include "amdxdna_carvedout_buf.h"
@@ -875,6 +876,204 @@ amdxdna_gem_create_carvedout_object(struct drm_device *dev, struct amdxdna_drm_c
 	return to_xdna_obj(gobj);
 }
 
+#ifdef AMDXDNA_DEVEL
+#define AMDXDNA_UNIFIED_BO_POOL_BYTES	(4UL << 20)
+
+struct amdxdna_pool_slice_priv {
+	struct amdxdna_dev	*xdna;
+	void			*cpu_addr;
+	dma_addr_t		dma_addr;
+	size_t			size;
+};
+
+static int amdxdna_gem_unified_pool_lazy_init(struct amdxdna_dev *xdna)
+{
+	struct gen_pool *pool;
+	void *va;
+	dma_addr_t dma;
+	int err;
+
+	if (!amdxdna_use_cma())
+		return 0;
+
+	mutex_lock(&xdna->dev_lock);
+	if (xdna->unified_bo_pool) {
+		err = 0;
+		goto out_unlock;
+	}
+
+	pool = gen_pool_create(PAGE_SHIFT, NUMA_NO_NODE);
+	if (!pool) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+
+	va = dma_alloc_coherent(xdna->ddev.dev, AMDXDNA_UNIFIED_BO_POOL_BYTES, &dma, GFP_KERNEL);
+	if (!va) {
+		gen_pool_destroy(pool);
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+
+	err = gen_pool_add(pool, (unsigned long)va, AMDXDNA_UNIFIED_BO_POOL_BYTES, NUMA_NO_NODE);
+	if (err) {
+		dma_free_coherent(xdna->ddev.dev, AMDXDNA_UNIFIED_BO_POOL_BYTES, va, dma);
+		gen_pool_destroy(pool);
+		goto out_unlock;
+	}
+
+	xdna->unified_bo_pool = pool;
+	xdna->unified_bo_vaddr = va;
+	xdna->unified_bo_dma = dma;
+	xdna->unified_bo_sz = AMDXDNA_UNIFIED_BO_POOL_BYTES;
+	XDNA_INFO(xdna, "Unified BO CMA pool %zu bytes at dma %#llx",
+		  xdna->unified_bo_sz, (u64)dma);
+	err = 0;
+out_unlock:
+	mutex_unlock(&xdna->dev_lock);
+	return err;
+}
+
+void amdxdna_gem_unified_pool_fini(struct amdxdna_dev *xdna)
+{
+	mutex_lock(&xdna->dev_lock);
+	if (!xdna->unified_bo_pool) {
+		mutex_unlock(&xdna->dev_lock);
+		return;
+	}
+
+	if (gen_pool_avail(xdna->unified_bo_pool) != xdna->unified_bo_sz)
+		XDNA_WARN(xdna, "unified BO pool not empty on fini (avail %zu of %zu)",
+			  gen_pool_avail(xdna->unified_bo_pool), xdna->unified_bo_sz);
+
+	dma_free_coherent(xdna->ddev.dev, xdna->unified_bo_sz,
+			  xdna->unified_bo_vaddr, xdna->unified_bo_dma);
+	gen_pool_destroy(xdna->unified_bo_pool);
+	xdna->unified_bo_pool = NULL;
+	xdna->unified_bo_vaddr = NULL;
+	xdna->unified_bo_dma = 0;
+	xdna->unified_bo_sz = 0;
+	mutex_unlock(&xdna->dev_lock);
+}
+
+static struct sg_table *pool_slice_map(struct dma_buf_attachment *attach,
+				       enum dma_data_direction dir)
+{
+	struct amdxdna_pool_slice_priv *s = attach->dmabuf->priv;
+	struct scatterlist *sg;
+	struct sg_table *sgt;
+	int ret;
+
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+	if (!sgt)
+		return ERR_PTR(-ENOMEM);
+	sg = kzalloc(sizeof(*sg), GFP_KERNEL);
+	if (!sg) {
+		kfree(sgt);
+		return ERR_PTR(-ENOMEM);
+	}
+	sg_init_table(sg, 1);
+	sg_dma_address(sg) = dma_map_resource(attach->dev, s->dma_addr, s->size, dir,
+					      DMA_ATTR_SKIP_CPU_SYNC);
+	ret = dma_mapping_error(attach->dev, sg_dma_address(sg));
+	if (ret) {
+		kfree(sg);
+		kfree(sgt);
+		return ERR_PTR(-EIO);
+	}
+	sg_assign_page(sg, NULL);
+	sg->offset = 0;
+	sg_dma_len(sg) = s->size;
+	sgt->orig_nents = 1;
+	sgt->nents = 1;
+	sgt->sgl = sg;
+	return sgt;
+}
+
+static void pool_slice_unmap(struct dma_buf_attachment *attach,
+			     struct sg_table *sgt,
+			     enum dma_data_direction dir)
+{
+	struct scatterlist *sg = sgt->sgl;
+
+	dma_unmap_resource(attach->dev, sg_dma_address(sg), sg_dma_len(sg),
+			   dir, DMA_ATTR_SKIP_CPU_SYNC);
+	kfree(sg);
+	kfree(sgt);
+}
+
+static void pool_slice_release(struct dma_buf *dbuf)
+{
+	struct amdxdna_pool_slice_priv *s = dbuf->priv;
+
+	if (s && s->xdna && s->xdna->unified_bo_pool)
+		gen_pool_free(s->xdna->unified_bo_pool, (unsigned long)s->cpu_addr, s->size);
+	kfree(s);
+}
+
+static int pool_slice_mmap(struct dma_buf *dbuf, struct vm_area_struct *vma)
+{
+	struct amdxdna_pool_slice_priv *s = dbuf->priv;
+	struct amdxdna_dev *xdna = s->xdna;
+	size_t msize = vma->vm_end - vma->vm_start;
+	unsigned long vm_pgoff;
+	int ret;
+
+	if (msize > s->size)
+		return -EINVAL;
+	vm_pgoff = vma->vm_pgoff;
+	vma->vm_pgoff = 0;
+	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+	ret = dma_mmap_coherent(xdna->ddev.dev, vma, s->cpu_addr, s->dma_addr, s->size);
+	vma->vm_pgoff = vm_pgoff;
+	return ret;
+}
+
+static int pool_slice_vmap(struct dma_buf *dbuf, struct iosys_map *map)
+{
+	struct amdxdna_pool_slice_priv *s = dbuf->priv;
+
+	iosys_map_set_vaddr(map, s->cpu_addr);
+	return 0;
+}
+
+static const struct dma_buf_ops amdxdna_pool_slice_ops = {
+	.map_dma_buf = pool_slice_map,
+	.unmap_dma_buf = pool_slice_unmap,
+	.release = pool_slice_release,
+	.mmap = pool_slice_mmap,
+	.vmap = pool_slice_vmap,
+};
+
+static struct dma_buf *amdxdna_pool_slice_to_dmabuf(struct amdxdna_dev *xdna,
+						  unsigned long pva, size_t size)
+{
+	struct amdxdna_pool_slice_priv *s;
+	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+
+	s = kzalloc(sizeof(*s), GFP_KERNEL);
+	if (!s)
+		return ERR_PTR(-ENOMEM);
+	s->xdna = xdna;
+	s->cpu_addr = (void *)pva;
+	s->size = size;
+	s->dma_addr = xdna->unified_bo_dma +
+		      (pva - (unsigned long)xdna->unified_bo_vaddr);
+
+	exp_info.ops = &amdxdna_pool_slice_ops;
+	exp_info.size = size;
+	exp_info.priv = s;
+	exp_info.flags = O_RDWR;
+	return dma_buf_export(&exp_info);
+}
+#endif /* AMDXDNA_DEVEL */
+
+#ifndef AMDXDNA_DEVEL
+void amdxdna_gem_unified_pool_fini(struct amdxdna_dev *xdna)
+{
+}
+#endif
+
 static struct amdxdna_gem_obj *
 amdxdna_gem_create_cma_object(struct drm_device *dev, struct amdxdna_drm_create_bo *args)
 {
@@ -892,6 +1091,30 @@ amdxdna_gem_create_cma_object(struct drm_device *dev, struct amdxdna_drm_create_
 		XDNA_ERR(xdna, "Invalid BO size 0x%llx", args->size);
 		return ERR_PTR(-EINVAL);
 	}
+
+#ifdef AMDXDNA_DEVEL
+	/* Keep UMQ + exec buffers in one coherent chunk so CERT can complete. */
+	amdxdna_gem_unified_pool_lazy_init(xdna);
+	if (xdna->unified_bo_pool) {
+		unsigned long pva = gen_pool_alloc(xdna->unified_bo_pool, size);
+
+		if (pva) {
+			dma_buf = amdxdna_pool_slice_to_dmabuf(xdna, pva, size);
+			if (IS_ERR(dma_buf)) {
+				gen_pool_free(xdna->unified_bo_pool, pva, size);
+			} else {
+				gobj = dev->driver->gem_prime_import(dev, dma_buf);
+				if (IS_ERR(gobj)) {
+					dma_buf_put(dma_buf);
+					gen_pool_free(xdna->unified_bo_pool, pva, size);
+				} else {
+					dma_buf_put(dma_buf);
+					return to_xdna_obj(gobj);
+				}
+			}
+		}
+	}
+#endif
 
 	dma_buf = amdxdna_get_cma_buf_with_fallback(xdna->cma_region_devs,
 						    MAX_MEM_REGIONS,

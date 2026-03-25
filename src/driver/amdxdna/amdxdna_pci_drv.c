@@ -9,6 +9,7 @@
 
 #include "amdxdna_dpt.h"
 #include "amdxdna_pci_drv.h"
+#include "amdxdna_gem.h"
 #include "amdxdna_sysfs.h"
 #include "amdxdna_pm.h"
 #ifdef AMDXDNA_DEVEL
@@ -239,6 +240,10 @@ static void amdxdna_remove(struct pci_dev *pdev)
 						  struct amdxdna_client, node);
 	}
 	mutex_unlock(&xdna->dev_lock);
+
+#ifdef AMDXDNA_DEVEL
+	amdxdna_gem_unified_pool_fini(xdna);
+#endif
 
 	/*
 	 * Disable runtime PM before tearing down. This must be done before
