@@ -207,8 +207,10 @@ static inline int is_npu3_vf_dev(const struct pci_dev *pdev)
 void aie4_debugfs_init(struct amdxdna_dev *xdna);
 
 /* aie4_error.c */
-int aie4_error_async_events_alloc(struct amdxdna_dev_hdl *ndev);
+int aie4_error_async_events_alloc(struct amdxdna_dev_hdl *ndev, u32 slot_cnt);
 void aie4_error_async_events_free(struct amdxdna_dev_hdl *ndev);
+int aie4_error_async_events_register(struct amdxdna_dev_hdl *ndev);
+void aie4_error_async_events_unregister(struct amdxdna_dev_hdl *ndev);
 int aie4_error_async_msg_thread(void *data);
 int aie4_error_get_last_async(struct amdxdna_dev *xdna,
 			      struct amdxdna_async_err_cache *err_cache, u32 num_errs,
@@ -220,9 +222,9 @@ int aie4_resume_fw(struct amdxdna_dev_hdl *ndev);
 int aie4_force_preemption(struct amdxdna_dev_hdl *ndev);
 int aie4_hws_debug_mode(struct amdxdna_dev_hdl *ndev, u32 ctx_id);
 int aie4_check_firmware_version(struct amdxdna_dev_hdl *ndev);
-int aie4_register_asyn_event_msg(struct amdxdna_dev_hdl *ndev,
-				 struct amdxdna_mgmt_dma_hdl *dma_hdl, void *handle,
-				 int (*cb)(void*, void __iomem *, size_t));
+int aie4_register_async_event_msg(struct amdxdna_dev_hdl *ndev,
+				  struct amdxdna_mgmt_dma_hdl *dma_hdl, void *handle,
+				  int (*cb)(void*, void __iomem *, size_t));
 int aie4_query_aie_status(struct amdxdna_dev_hdl *ndev, char *buf, u32 size, u32 *cols_filled);
 int aie4_query_cert_firmware_version(struct amdxdna_dev_hdl *ndev);
 int aie4_query_aie_version(struct amdxdna_dev_hdl *ndev, struct aie_version *version);

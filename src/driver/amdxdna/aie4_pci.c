@@ -4,6 +4,7 @@
  */
 
 #include <linux/version.h>
+#include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/kthread.h>
 #include <linux/iommu.h>
@@ -14,11 +15,11 @@
 #include "drm_local/amdxdna_accel.h"
 
 #include "aie4_pci.h"
+#include "aie_buffer.h"
 #include "aie4_message.h"
 #include "aie2_tdr.h"
 #include "aie4_solver.h"
 #include "aie4_devel.h"
-#include "amdxdna_dpt.h"
 #include "amdxdna_pm.h"
 #include "amdxdna_trace.h"
 #include "amdxdna_mgmt.h"
@@ -522,7 +523,8 @@ static int aie4_hw_start(struct amdxdna_dev *xdna)
 	if (ret)
 		goto stop_pm;
 
-	ret = aie4_error_async_events_alloc(ndev);
+	ret = aie_hw_buffers_register(ndev, aie4_hw_fw_buffers,
+				      ARRAY_SIZE(aie4_hw_fw_buffers));
 	if (ret)
 		goto partition_fini;
 
@@ -577,6 +579,8 @@ static void aie4_hw_stop(struct amdxdna_dev *xdna)
 
 	aie4_partition_fini(ndev);
 	aie4_pm_fini(ndev);
+	aie_hw_buffers_unregister(ndev, aie4_hw_fw_buffers,
+				  ARRAY_SIZE(aie4_hw_fw_buffers));
 	aie4_mgmt_fw_fini(ndev);
 	aie4_mailbox_fini(ndev);
 	ndev->mbox = NULL;
@@ -584,8 +588,6 @@ static void aie4_hw_stop(struct amdxdna_dev *xdna)
 	aie4_irq_fini(ndev);
 
 	aie4_fw_unload(ndev);
-
-	aie4_error_async_events_free(ndev);
 
 	ndev->dev_status = AIE4_DEV_INIT;
 }
@@ -742,6 +744,48 @@ static void aie4_free_work_buffer(struct amdxdna_dev_hdl *ndev)
 		amdxdna_mgmt_buff_free(ndev->mpnpu_work_buffer);
 }
 
+static int aie4_probe_async_alloc(struct amdxdna_dev_hdl *ndev)
+{
+	struct pci_dev *pdev = to_pci_dev(ndev->xdna->ddev.dev);
+	u32 async_slots = is_npu3_pf_dev(pdev) ? 0 : aie4_max_col;
+
+	return aie4_error_async_events_alloc(ndev, async_slots);
+}
+
+static void aie4_probe_async_free(struct amdxdna_dev_hdl *ndev)
+{
+	aie4_error_async_events_free(ndev);
+}
+
+/*
+ * Probe-time DMA buffers: order is alloc forward, free reverse. Device quirks
+ * (NPU3 PF slot count, VF work buffer) live in the per-stage callbacks, not in
+ * aie_buffer.c.
+ */
+static const struct amdxdna_buffer_probe_ops aie4_probe_dma_buffers[] = {
+	{ .alloc = aie4_alloc_work_buffer, .free = aie4_free_work_buffer },
+	{ .alloc = aie4_probe_async_alloc, .free = aie4_probe_async_free },
+};
+
+static const struct amdxdna_buffer_hw_ops aie4_hw_fw_buffers[] = {
+	{
+		.register_fw = aie4_error_async_events_register,
+		.unregister_fw = aie4_error_async_events_unregister,
+	},
+};
+
+static int aie4_buffers_alloc(struct amdxdna_dev_hdl *ndev)
+{
+	return aie_probe_buffers_alloc(ndev, aie4_probe_dma_buffers,
+				       ARRAY_SIZE(aie4_probe_dma_buffers));
+}
+
+static void aie4_buffers_free(struct amdxdna_dev_hdl *ndev)
+{
+	aie_probe_buffers_free(ndev, aie4_probe_dma_buffers,
+			       ARRAY_SIZE(aie4_probe_dma_buffers));
+}
+
 static int aie4_pcidev_init(struct amdxdna_dev_hdl *ndev)
 {
 	struct amdxdna_dev *xdna = ndev->xdna;
@@ -813,19 +857,18 @@ static int aie4_pcidev_init(struct amdxdna_dev_hdl *ndev)
 
 	pci_set_master(pdev);
 
-	/*TODO: split this to alloc and attach, same as work buffer */
-	ret = aie4_alloc_work_buffer(ndev);
+	ret = aie4_buffers_alloc(ndev);
 	if (ret)
 		goto clear_master;
 
 	ret = aie4_hw_start(xdna);
 	if (ret)
-		goto free_work_buf;
+		goto free_dma_buffers;
 
 	return ret;
 
-free_work_buf:
-	aie4_free_work_buffer(ndev);
+free_dma_buffers:
+	aie4_buffers_free(ndev);
 clear_master:
 	pci_clear_master(pdev);
 
@@ -1398,8 +1441,7 @@ static void aie4_pcidev_fini(struct amdxdna_dev_hdl *ndev)
 	aie4_hw_stop(xdna);
 	mutex_unlock(&ndev->aie4_lock);
 
-	/* TODO: (work, async, etc free here) */
-	aie4_free_work_buffer(ndev);
+	aie4_buffers_free(ndev);
 
 	pci_clear_master(pdev);
 	/* pcim_enable_device will be disabled automatically */

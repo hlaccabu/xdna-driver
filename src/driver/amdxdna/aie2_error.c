@@ -21,6 +21,7 @@ struct async_event {
 struct async_events {
 	struct workqueue_struct		*wq;
 	u32				event_cnt;
+	bool				fw_registered;
 	struct async_event		event[] __counted_by(event_cnt);
 };
 
@@ -336,47 +337,56 @@ static void aie2_error_worker(struct work_struct *err_work)
 
 	aie2_async_errors_cache(e->ndev, info->payload, info->err_cnt);
 
+reregister:
+	if (!e->ndev->async_events ||
+	    !READ_ONCE(e->ndev->async_events->fw_registered))
+		return;
+
 	mutex_lock(&xdna->dev_handle->aie2_lock);
-	/* Re-sent this event to firmware */
-	if (aie2_error_event_send(e))
+	if (e->ndev->async_events &&
+	    READ_ONCE(e->ndev->async_events->fw_registered) &&
+	    aie2_error_event_send(e))
 		XDNA_WARN(xdna, "Unable to register async event");
 	mutex_unlock(&xdna->dev_handle->aie2_lock);
 }
 
 void aie2_error_async_events_free(struct amdxdna_dev_hdl *ndev)
 {
-	struct amdxdna_dev *xdna = ndev->xdna;
-	struct async_events *events;
+	struct async_events *events = ndev->async_events;
 	int i;
 
-	drm_WARN_ON(&xdna->ddev, mutex_is_locked(&ndev->aie2_lock));
-	events = ndev->async_events;
+	if (!events)
+		return;
+
+	if (WARN_ON(events->fw_registered))
+		return;
+
 	destroy_workqueue(events->wq);
 
-	for (i = 0; i < events->event_cnt; i++) {
-		struct async_event *e = &events->event[i];
+	for (i = 0; i < events->event_cnt; i++)
+		amdxdna_mgmt_buff_free(events->event[i].dma_hdl);
 
-		amdxdna_mgmt_buff_free(e->dma_hdl);
-	}
 	kfree(events);
+	ndev->async_events = NULL;
 }
 
-int aie2_error_async_events_alloc(struct amdxdna_dev_hdl *ndev)
+int aie2_error_async_events_alloc(struct amdxdna_dev_hdl *ndev, u32 slot_cnt)
 {
 	struct amdxdna_dev *xdna = ndev->xdna;
 	struct async_events *events;
 	struct async_event *e;
 	int i, ret;
 
-	events = kzalloc(struct_size(events, event, ndev->total_col), GFP_KERNEL);
+	events = kzalloc(struct_size(events, event, slot_cnt), GFP_KERNEL);
 	if (!events)
 		return -ENOMEM;
 
-	events->event_cnt = ndev->total_col;
+	events->event_cnt = slot_cnt;
+	events->fw_registered = false;
 	events->wq = alloc_ordered_workqueue("async_wq", 0);
 	if (!events->wq) {
 		ret = -ENOMEM;
-		goto free_events;
+		goto out_kfree_events;
 	}
 
 	for (i = 0; i < events->event_cnt; i++) {
@@ -394,36 +404,64 @@ int aie2_error_async_events_alloc(struct amdxdna_dev_hdl *ndev)
 	}
 
 	ndev->async_events = events;
-
-	for (i = 0; i < ndev->async_events->event_cnt; i++) {
-		e = &ndev->async_events->event[i];
-		ret = aie2_error_event_send(e);
-		if (ret)
-			goto free_buf;
-	}
-
-	/* Just to make sure firmware handled async events */
-	ret = aie2_query_aie_firmware_version(ndev, &ndev->xdna->fw_ver);
-	if (ret) {
-		XDNA_ERR(xdna, "Re-query firmware version failed");
-		goto free_buf;
-	}
-
-	XDNA_DBG(xdna, "Async event count %d, buf total size 0x%x",
-		 events->event_cnt, ASYNC_BUF_SIZE);
 	return 0;
 
 free_buf:
 	while (i) {
-		struct async_event *e = &events->event[i - 1];
-
+		e = &events->event[i - 1];
 		amdxdna_mgmt_buff_free(e->dma_hdl);
 		--i;
 	}
 	destroy_workqueue(events->wq);
-free_events:
+out_kfree_events:
 	kfree(events);
 	return ret;
+}
+
+int aie2_error_async_events_register(struct amdxdna_dev_hdl *ndev)
+{
+	struct amdxdna_dev *xdna = ndev->xdna;
+	struct async_events *events = ndev->async_events;
+	struct async_event *e;
+	u32 n, i;
+	int ret;
+
+	if (!events || events->fw_registered)
+		return 0;
+
+	n = min(ndev->total_col, events->event_cnt);
+	for (i = 0; i < n; i++) {
+		e = &events->event[i];
+		ret = aie2_error_event_send(e);
+		if (ret)
+			return ret;
+	}
+
+	ret = aie2_query_aie_firmware_version(ndev, &ndev->xdna->fw_ver);
+	if (ret) {
+		XDNA_ERR(xdna, "Re-query firmware version failed");
+		return ret;
+	}
+
+	events->fw_registered = true;
+
+	XDNA_DBG(xdna, "Async event slots %u registered (of %u), buf size 0x%x",
+		 n, events->event_cnt, ASYNC_BUF_SIZE);
+	return 0;
+}
+
+void aie2_error_async_events_unregister(struct amdxdna_dev_hdl *ndev)
+{
+	struct async_events *events = ndev->async_events;
+
+	if (!events || !events->fw_registered)
+		return;
+
+	events->fw_registered = false;
+
+	mutex_unlock(&ndev->aie2_lock);
+	flush_workqueue(events->wq);
+	mutex_lock(&ndev->aie2_lock);
 }
 
 /**

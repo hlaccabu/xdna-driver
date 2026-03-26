@@ -4,6 +4,7 @@
  */
 
 #include <linux/errno.h>
+#include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/iommu.h>
 #include <linux/firmware.h>
@@ -14,6 +15,7 @@
 
 #include "aie2_pci.h"
 #include "aie2_msg_priv.h"
+#include "aie_buffer.h"
 #include "amdxdna_mgmt.h"
 
 #ifdef AMDXDNA_DEVEL
@@ -322,6 +324,39 @@ static void aie2_mgmt_fw_fini(struct amdxdna_dev_hdl *ndev)
 	XDNA_DBG(ndev->xdna, "npu firmware suspended");
 }
 
+static int aie2_probe_async_alloc(struct amdxdna_dev_hdl *ndev)
+{
+	return aie2_error_async_events_alloc(ndev, aie2_max_col);
+}
+
+static void aie2_probe_async_free(struct amdxdna_dev_hdl *ndev)
+{
+	aie2_error_async_events_free(ndev);
+}
+
+static const struct amdxdna_buffer_probe_ops aie2_probe_dma_buffers[] = {
+	{ .alloc = aie2_probe_async_alloc, .free = aie2_probe_async_free },
+};
+
+static const struct amdxdna_buffer_hw_ops aie2_hw_fw_buffers[] = {
+	{
+		.register_fw = aie2_error_async_events_register,
+		.unregister_fw = aie2_error_async_events_unregister,
+	},
+};
+
+static int aie2_buffers_alloc(struct amdxdna_dev_hdl *ndev)
+{
+	return aie_probe_buffers_alloc(ndev, aie2_probe_dma_buffers,
+				       ARRAY_SIZE(aie2_probe_dma_buffers));
+}
+
+static void aie2_buffers_free(struct amdxdna_dev_hdl *ndev)
+{
+	aie_probe_buffers_free(ndev, aie2_probe_dma_buffers,
+			       ARRAY_SIZE(aie2_probe_dma_buffers));
+}
+
 static void aie2_hw_stop(struct amdxdna_dev *xdna)
 {
 	struct pci_dev *pdev = to_pci_dev(xdna->ddev.dev);
@@ -333,6 +368,7 @@ static void aie2_hw_stop(struct amdxdna_dev *xdna)
 	}
 
 	mutex_lock(&ndev->aie2_lock);
+	aie2_error_async_events_unregister(ndev);
 	aie2_pm_fini(ndev);
 	aie2_mgmt_fw_fini(ndev);
 	xdna_mailbox_stop_channel(ndev->mgmt_chann);
@@ -346,7 +382,6 @@ static void aie2_hw_stop(struct amdxdna_dev *xdna)
 	aie2_smu_stop(ndev);
 	mutex_unlock(&ndev->aie2_lock);
 
-	aie2_error_async_events_free(ndev);
 	pci_clear_master(pdev);
 	pci_disable_device(pdev);
 
@@ -433,9 +468,10 @@ static int aie2_hw_start(struct amdxdna_dev *xdna)
 		goto pm_fini;
 	}
 
-	ret = aie2_error_async_events_alloc(ndev);
+	ret = aie_hw_buffers_register(ndev, aie2_hw_fw_buffers,
+				      ARRAY_SIZE(aie2_hw_fw_buffers));
 	if (ret) {
-		XDNA_ERR(xdna, "Allocate async events failed, ret %d", ret);
+		XDNA_ERR(xdna, "async events register failed, ret %d", ret);
 		goto pm_fini;
 	}
 
@@ -609,9 +645,16 @@ skip_pasid:
 
 	xdna->dev_handle = ndev;
 
+	ret = aie2_buffers_alloc(ndev);
+	if (ret) {
+		XDNA_ERR(xdna, "probe DMA buffers failed, ret %d", ret);
+		goto disable_sva;
+	}
+
 	ret = aie2_hw_start(xdna);
 	if (ret) {
 		XDNA_ERR(xdna, "start npu failed, ret %d", ret);
+		aie2_buffers_free(ndev);
 		goto disable_sva;
 	}
 
@@ -627,6 +670,7 @@ skip_pasid:
 
 stop_hw:
 	aie2_hw_stop(xdna);
+	aie2_buffers_free(ndev);
 disable_sva:
 #ifdef HAVE_iommu_dev_enable_disable_feature
 	iommu_dev_disable_feature(&pdev->dev, IOMMU_DEV_FEAT_SVA);
@@ -646,6 +690,7 @@ static void aie2_fini(struct amdxdna_dev *xdna)
 
 	aie2_rq_fini(&ndev->ctx_rq);
 	aie2_hw_stop(xdna);
+	aie2_buffers_free(ndev);
 	aie2_psp_destroy(&pdev->dev, ndev->psp_hdl);
 #ifdef AMDXDNA_DEVEL
 	if (iommu_mode != AMDXDNA_IOMMU_PASID)
