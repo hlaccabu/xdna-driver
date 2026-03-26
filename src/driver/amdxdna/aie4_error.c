@@ -21,6 +21,7 @@ struct async_event {
 struct async_events {
 	struct workqueue_struct		*wq;
 	u32				event_cnt;
+	bool				fw_registered;
 	struct async_event		event[] __counted_by(event_cnt);
 };
 
@@ -463,7 +464,7 @@ static int aie4_error_async_cb(void *handle, void __iomem *data, size_t size)
 static int aie4_error_event_send(struct async_event *e)
 {
 	amdxdna_mgmt_buff_clflush(e->dma_hdl, 0, 0);
-	return aie4_register_asyn_event_msg(e->ndev, e->dma_hdl, e, aie4_error_async_cb);
+	return aie4_register_async_event_msg(e->ndev, e->dma_hdl, e, aie4_error_async_cb);
 }
 
 static void aie4_error_worker(struct work_struct *err_work)
@@ -524,29 +525,35 @@ static void aie4_error_worker(struct work_struct *err_work)
 	aie4_async_errors_cache(e->ndev, info->payload, info->err_cnt);
 
 reregister:
+	if (!e->ndev->async_events ||
+	    !READ_ONCE(e->ndev->async_events->fw_registered))
+		return;
 	mutex_lock(&xdna->dev_handle->aie4_lock);
-	/* Re-sent this event to firmware */
-	if (aie4_error_event_send(e))
+	if (e->ndev->async_events &&
+	    READ_ONCE(e->ndev->async_events->fw_registered) &&
+	    aie4_error_event_send(e))
 		XDNA_WARN(xdna, "Unable to register async event");
 	mutex_unlock(&xdna->dev_handle->aie4_lock);
 }
 
 void aie4_error_async_events_free(struct amdxdna_dev_hdl *ndev)
 {
-	//struct amdxdna_dev *xdna = ndev->xdna;
-	struct async_events *events;
+	struct async_events *events = ndev->async_events;
 	int i;
 
-	//drm_WARN_ON(&xdna->ddev, mutex_is_locked(&ndev->aie4_lock));
-	events = ndev->async_events;
+	if (!events)
+		return;
+
+	if (WARN_ON(events->fw_registered))
+		return;
+
 	destroy_workqueue(events->wq);
 
-	for (i = 0; i < events->event_cnt; i++) {
-		struct async_event *e = &events->event[i];
+	for (i = 0; i < events->event_cnt; i++)
+		amdxdna_mgmt_buff_free(events->event[i].dma_hdl);
 
-		amdxdna_mgmt_buff_free(e->dma_hdl);
-	}
 	kfree(events);
+	ndev->async_events = NULL;
 }
 
 int aie4_error_async_events_alloc(struct amdxdna_dev_hdl *ndev)
@@ -561,10 +568,11 @@ int aie4_error_async_events_alloc(struct amdxdna_dev_hdl *ndev)
 		return -ENOMEM;
 
 	events->event_cnt = ndev->total_col;
+	events->fw_registered = false;
 	events->wq = alloc_ordered_workqueue("async_wq", 0);
 	if (!events->wq) {
 		ret = -ENOMEM;
-		goto free_events;
+		goto out_kfree_events;
 	}
 
 	for (i = 0; i < events->event_cnt; i++) {
@@ -582,36 +590,70 @@ int aie4_error_async_events_alloc(struct amdxdna_dev_hdl *ndev)
 	}
 
 	ndev->async_events = events;
+	return 0;
 
-	for (i = 0; i < ndev->async_events->event_cnt; i++) {
-		e = &ndev->async_events->event[i];
+free_buf:
+	while (i) {
+		e = &events->event[i - 1];
+		amdxdna_mgmt_buff_free(e->dma_hdl);
+		--i;
+	}
+	destroy_workqueue(events->wq);
+out_kfree_events:
+	kfree(events);
+	return ret;
+}
+
+int aie4_error_async_events_register(struct amdxdna_dev_hdl *ndev)
+{
+	struct amdxdna_dev *xdna = ndev->xdna;
+	struct async_events *events = ndev->async_events;
+	struct async_event *e;
+	u32 n, i;
+	int ret;
+
+	if (!events || events->fw_registered)
+		return 0;
+
+	n = min(ndev->total_col, events->event_cnt);
+	for (i = 0; i < n; i++) {
+		e = &events->event[i];
 		ret = aie4_error_event_send(e);
 		if (ret)
-			goto free_buf;
+			return ret;
 	}
 
 	/* Just to make sure firmware handled async events */
 	ret = aie4_check_firmware_version(ndev);
 	if (ret) {
 		XDNA_ERR(xdna, "Re-query firmware version failed");
-		goto free_buf;
+		return ret;
 	}
 
-	XDNA_DBG(xdna, "Async event count %d, buf total size 0x%x",
-		 events->event_cnt, ASYNC_BUF_SIZE);
+	events->fw_registered = true;
+
+	XDNA_DBG(xdna, "Async event slots %u registered (of %u), buf size 0x%x",
+		 n, events->event_cnt, ASYNC_BUF_SIZE);
 	return 0;
+}
 
-free_buf:
-	while (i) {
-		struct async_event *e = &events->event[i - 1];
+void aie4_error_async_events_unregister(struct amdxdna_dev_hdl *ndev)
+{
+	struct async_events *events = ndev->async_events;
 
-		amdxdna_mgmt_buff_free(e->dma_hdl);
-		--i;
-	}
-	destroy_workqueue(events->wq);
-free_events:
-	kfree(events);
-	return ret;
+	if (!events || !events->fw_registered)
+		return;
+
+	events->fw_registered = false;
+
+	/*
+	 * aie4_error_worker() retakes aie4_lock when re-registering; this path
+	 * runs under aie4_lock from aie4_hw_stop(). Briefly drop the lock so
+	 * flush_workqueue() can complete any in-flight worker.
+	 */
+	mutex_unlock(&ndev->aie4_lock);
+	flush_workqueue(events->wq);
+	mutex_lock(&ndev->aie4_lock);
 }
 
 int aie4_error_get_last_async(struct amdxdna_dev *xdna,

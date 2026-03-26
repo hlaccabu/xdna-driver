@@ -18,7 +18,6 @@
 #include "aie2_tdr.h"
 #include "aie4_solver.h"
 #include "aie4_devel.h"
-#include "amdxdna_dpt.h"
 #include "amdxdna_pm.h"
 #include "amdxdna_trace.h"
 #include "amdxdna_mgmt.h"
@@ -522,7 +521,7 @@ static int aie4_hw_start(struct amdxdna_dev *xdna)
 	if (ret)
 		goto stop_pm;
 
-	ret = aie4_error_async_events_alloc(ndev);
+	ret = aie4_error_async_events_register(ndev);
 	if (ret)
 		goto partition_fini;
 
@@ -577,6 +576,7 @@ static void aie4_hw_stop(struct amdxdna_dev *xdna)
 
 	aie4_partition_fini(ndev);
 	aie4_pm_fini(ndev);
+	aie4_error_async_events_unregister(ndev);
 	aie4_mgmt_fw_fini(ndev);
 	aie4_mailbox_fini(ndev);
 	ndev->mbox = NULL;
@@ -584,8 +584,6 @@ static void aie4_hw_stop(struct amdxdna_dev *xdna)
 	aie4_irq_fini(ndev);
 
 	aie4_fw_unload(ndev);
-
-	aie4_error_async_events_free(ndev);
 
 	ndev->dev_status = AIE4_DEV_INIT;
 }
@@ -742,6 +740,31 @@ static void aie4_free_work_buffer(struct amdxdna_dev_hdl *ndev)
 		amdxdna_mgmt_buff_free(ndev->mpnpu_work_buffer);
 }
 
+static int aie4_buffers_alloc(struct amdxdna_dev_hdl *ndev)
+{
+	int ret;
+
+	ret = aie4_alloc_work_buffer(ndev);
+	if (ret)
+		return ret;
+
+	ret = aie4_error_async_events_alloc(ndev);
+	if (ret)
+		goto free_work;
+
+	return 0;
+
+free_work:
+	aie4_free_work_buffer(ndev);
+	return ret;
+}
+
+static void aie4_buffers_free(struct amdxdna_dev_hdl *ndev)
+{
+	aie4_error_async_events_free(ndev);
+	aie4_free_work_buffer(ndev);
+}
+
 static int aie4_pcidev_init(struct amdxdna_dev_hdl *ndev)
 {
 	struct amdxdna_dev *xdna = ndev->xdna;
@@ -813,19 +836,18 @@ static int aie4_pcidev_init(struct amdxdna_dev_hdl *ndev)
 
 	pci_set_master(pdev);
 
-	/*TODO: split this to alloc and attach, same as work buffer */
-	ret = aie4_alloc_work_buffer(ndev);
+	ret = aie4_buffers_alloc(ndev);
 	if (ret)
 		goto clear_master;
 
 	ret = aie4_hw_start(xdna);
 	if (ret)
-		goto free_work_buf;
+		goto free_dma_buffers;
 
 	return ret;
 
-free_work_buf:
-	aie4_free_work_buffer(ndev);
+free_dma_buffers:
+	aie4_buffers_free(ndev);
 clear_master:
 	pci_clear_master(pdev);
 
@@ -1398,8 +1420,7 @@ static void aie4_pcidev_fini(struct amdxdna_dev_hdl *ndev)
 	aie4_hw_stop(xdna);
 	mutex_unlock(&ndev->aie4_lock);
 
-	/* TODO: (work, async, etc free here) */
-	aie4_free_work_buffer(ndev);
+	aie4_buffers_free(ndev);
 
 	pci_clear_master(pdev);
 	/* pcim_enable_device will be disabled automatically */
