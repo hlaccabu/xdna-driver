@@ -52,6 +52,7 @@ struct aie_device {
 	struct amdxdna_drm_query_aie_version version;
 	struct amdxdna_drm_query_aie_metadata metadata;
 	struct aie_msg_ops msg_ops;
+	u32	force_preempt_enabled;
 
 	u32 clk_gating;
 	u32 npuclk_freq;
@@ -152,6 +153,9 @@ int amdxdna_get_aie_version(struct amdxdna_client *client,
 int amdxdna_get_firmware_version(struct amdxdna_client *client,
 				 struct amdxdna_drm_get_info *args,
 				 struct amdxdna_drm_query_firmware_version *version);
+int amdxdna_get_preempt_state(struct aie_device *aie, struct amdxdna_drm_get_info *args);
+int amdxdna_set_preempt_state(struct aie_device *aie, struct amdxdna_client *client,
+				struct amdxdna_drm_set_state *args);
 void amdxdna_hmm_invalidate(struct amdxdna_gem_obj *abo, unsigned long cur_seq);
 
 struct amdxdna_msg_buf_hdl {
