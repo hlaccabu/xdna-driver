@@ -3,156 +3,179 @@
  * Copyright (C) 2026, Advanced Micro Devices, Inc.
  */
 
-#include <linux/atomic.h>
 #include <linux/device.h>
-#include <linux/kfifo.h>
-#include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/rcupdate.h>
+#include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/rpmsg.h>
 #include <linux/slab.h>
-#include <linux/wait.h>
+#include <linux/stddef.h>
 
 #include "amdrnpu_internal.h"
 
-/*
- * Monotonic instance counter for naming /dev/amdrnpu.N.  Only ever
- * incremented so disconnect/reconnect of the same remoteproc still gets a
- * fresh minor name (avoids stale-fd confusion in userspace).
- */
-static atomic_t amdrnpu_instance_counter = ATOMIC_INIT(0);
-
-int amdrnpu_rpmsg_send(struct amdrnpu_dev *dev, const void *data, size_t len)
+static struct device_node *amdrnpu_find_remoteproc_node(struct rpmsg_device *rpdev)
 {
-	struct rpmsg_device *rpdev;
-	int ret;
+	struct device *dev;
 
-	rcu_read_lock();
-	rpdev = rcu_dereference(dev->rpdev);
-	if (!rpdev) {
-		rcu_read_unlock();
-		return -ENODEV;
+	for (dev = rpdev->dev.parent; dev; dev = dev->parent) {
+		struct device_node *np = dev_of_node(dev);
+
+		if (np)
+			return np;
 	}
-	ret = rpmsg_send(rpdev->ept, (void *)data, len);
-	rcu_read_unlock();
-	return ret;
+	return NULL;
 }
 
-static int amdrnpu_rpmsg_cb(struct rpmsg_device *rpdev, void *data,
-			    int len, void *priv, u32 src)
+static struct platform_device *amdrnpu_find_platform_device(struct device_node *rproc_np)
 {
-	struct amdrnpu_dev *dev = dev_get_drvdata(&rpdev->dev);
-	struct amdrnpu_msg *msg;
+	struct device_node *np;
+	struct platform_device *pdev = NULL;
+	struct platform_device *chosen = NULL;
+	int dup = 0;
 
-	if (!dev)
-		return -ENODEV;
+	if (!rproc_np)
+		return NULL;
 
-	if (len <= 0 || len > AMDRNPU_MAX_PAYLOAD) {
-		dev_warn(&rpdev->dev,
-			 "amdrnpu: dropping rx frame: len=%d (max=%u)\n",
-			 len, AMDRNPU_MAX_PAYLOAD);
-		return -EINVAL;
+	for_each_compatible_node(np, NULL, "amd,amdrnpu") {
+		struct device_node *peer;
+
+		peer = of_parse_phandle(np, "amd,remoteproc", 0);
+		if (!peer)
+			continue;
+		if (peer != rproc_np) {
+			of_node_put(peer);
+			continue;
+		}
+		of_node_put(peer);
+
+		pdev = of_find_device_by_node(np);
+		if (!pdev)
+			continue;
+		if (!platform_get_drvdata(pdev)) {
+			put_device(&pdev->dev);
+			continue;
+		}
+
+		dup++;
+		if (chosen)
+			put_device(&chosen->dev);
+		chosen = pdev;
 	}
 
-	msg = kzalloc(sizeof(*msg), GFP_ATOMIC);
-	if (!msg)
-		return -ENOMEM;
+	if (!chosen)
+		return NULL;
 
-	msg->len = (__u32)len;
-	memcpy(msg->data, data, len);
+	if (dup > 1)
+		dev_warn_once(&chosen->dev,
+			      "multiple amd,amdrnpu nodes reference rproc node %pOFn; RPMsg bound to DT-last probed instance (fix duplicate nodes)\n",
+			      rproc_np);
 
-	mutex_lock(&dev->lock);
-	if (kfifo_is_full(&dev->rxfifo)) {
-		mutex_unlock(&dev->lock);
+	return chosen;
+}
+
+static int amdrnpu_rpmsg_cb(struct rpmsg_device *rpdev, void *data, int len,
+			    void *priv, u32 src)
+{
+	struct amdrnpu_dev *rnpu = dev_get_drvdata(&rpdev->dev);
+
+	if (!rnpu) {
+		/* Channel was unbound while a callback was racing in. */
 		dev_warn_ratelimited(&rpdev->dev,
-				     "amdrnpu: rx fifo full, dropping frame\n");
-		kfree(msg);
-		return -ENOSPC;
+				     "rpmsg msg dropped: channel not bound\n");
+		return 0;
 	}
-	kfifo_in(&dev->rxfifo, msg, 1);
-	mutex_unlock(&dev->lock);
 
-	wake_up_interruptible(&dev->rxwq);
-	kfree(msg);
+	if ((size_t)len < sizeof(struct amdrnpu_wire_rsp)) {
+		AMDRNPU_WARN(rnpu,
+			     "rpmsg msg too small (%d bytes, need packed rsp hdr %zu), dropping\n",
+			     len, sizeof(struct amdrnpu_wire_rsp));
+		return 0;
+	}
+
+	amdrnpu_cmd_dispatch_response(rnpu, data, (size_t)len);
 	return 0;
 }
 
 static int amdrnpu_rpmsg_probe(struct rpmsg_device *rpdev)
 {
-	struct amdrnpu_dev *dev;
-	int idx, ret;
+	struct device_node *rproc_np;
+	struct platform_device *pdev;
+	struct amdrnpu_dev *rnpu;
+	struct device_link *link;
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (!dev)
-		return -ENOMEM;
-
-	kref_init(&dev->refcount);
-	mutex_init(&dev->lock);
-	init_waitqueue_head(&dev->rxwq);
-	INIT_KFIFO(dev->rxfifo);
-	rcu_assign_pointer(dev->rpdev, rpdev);
-
-	idx = atomic_fetch_inc(&amdrnpu_instance_counter);
-	snprintf(dev->dev_name, sizeof(dev->dev_name), "%s.%d",
-		 AMDRNPU_DEVICE_NAME, idx);
-
-	ret = amdrnpu_chardev_register(dev);
-	if (ret) {
-		dev_err(&rpdev->dev,
-			"amdrnpu: misc_register(%s) failed: %d\n",
-			dev->dev_name, ret);
-		mutex_destroy(&dev->lock);
-		kfree(dev);
-		return ret;
+	rproc_np = amdrnpu_find_remoteproc_node(rpdev);
+	if (!rproc_np) {
+		dev_err(&rpdev->dev, "cannot find owning remoteproc DT node\n");
+		return -ENODEV;
 	}
 
-	dev_set_drvdata(&rpdev->dev, dev);
-	dev_info(&rpdev->dev,
-		 "amdrnpu: bound channel %s -> /dev/%s (ABI v%u, max payload %u)\n",
-		 rpdev->id.name, dev->dev_name, AMDRNPU_ABI_VERSION,
-		 AMDRNPU_MAX_PAYLOAD);
+	pdev = amdrnpu_find_platform_device(rproc_np);
+	if (!pdev) {
+		dev_dbg(&rpdev->dev,
+			"no amdrnpu platform device for rproc %pOFn yet, deferring\n",
+			rproc_np);
+		return -EPROBE_DEFER;
+	}
+
+	rnpu = platform_get_drvdata(pdev);
+	if (!rnpu) {
+		put_device(&pdev->dev);
+		return -EPROBE_DEFER;
+	}
+
+	link = device_link_add(&rpdev->dev, rnpu->dev,
+			       DL_FLAG_AUTOREMOVE_CONSUMER);
+	if (!link) {
+		put_device(&pdev->dev);
+		return -ENOMEM;
+	}
+
+	mutex_lock(&rnpu->rpmsg_lock);
+	rnpu->rpdev = rpdev;
+	dev_set_drvdata(&rpdev->dev, rnpu);
+	mutex_unlock(&rnpu->rpmsg_lock);
+
+	AMDRNPU_INFO(rnpu,
+		     "rpmsg channel %s attached (rproc node %pOFn)\n",
+		     dev_name(&rpdev->dev), rproc_np);
+
+	put_device(&pdev->dev);
 	return 0;
 }
 
 static void amdrnpu_rpmsg_remove(struct rpmsg_device *rpdev)
 {
-	struct amdrnpu_dev *dev = dev_get_drvdata(&rpdev->dev);
+	struct amdrnpu_dev *rnpu = dev_get_drvdata(&rpdev->dev);
 
-	if (!dev)
+	if (!rnpu)
 		return;
 
-	dev_info(&rpdev->dev, "amdrnpu: removing /dev/%s\n", dev->dev_name);
-	amdrnpu_chardev_deregister(dev);
-
-	/*
-	 * Fence the send path: after synchronize_rcu() returns, no caller is
-	 * inside rcu_read_lock() with a stale rpdev, so the rpmsg core can tear
-	 * the channel down without UAF risk.  Then wake any blocked RECV
-	 * waiters so they observe -ENODEV via the !rcu_access_pointer() check.
-	 */
-	rcu_assign_pointer(dev->rpdev, NULL);
-	synchronize_rcu();
-	wake_up_interruptible_all(&dev->rxwq);
-
+	mutex_lock(&rnpu->rpmsg_lock);
+	if (rnpu->rpdev == rpdev)
+		rnpu->rpdev = NULL;
 	dev_set_drvdata(&rpdev->dev, NULL);
-	amdrnpu_dev_put(dev);
+	mutex_unlock(&rnpu->rpmsg_lock);
+
+	amdrnpu_cmd_drain_rpmsg_detach(rnpu, -ENOTCONN);
+
+	AMDRNPU_INFO(rnpu, "rpmsg channel %s detached\n",
+		     dev_name(&rpdev->dev));
 }
 
 static const struct rpmsg_device_id amdrnpu_rpmsg_id_table[] = {
 	{ .name = AMDRNPU_RPMSG_NAME },
-	{ },
+	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(rpmsg, amdrnpu_rpmsg_id_table);
 
 static struct rpmsg_driver amdrnpu_rpmsg_driver = {
-	.drv = {
-		.name	= "amdrnpu_rpmsg",
-	},
+	.drv.name	= "amdrnpu_rpmsg",
 	.id_table	= amdrnpu_rpmsg_id_table,
 	.probe		= amdrnpu_rpmsg_probe,
-	.remove		= amdrnpu_rpmsg_remove,
 	.callback	= amdrnpu_rpmsg_cb,
+	.remove		= amdrnpu_rpmsg_remove,
 };
 
 int amdrnpu_rpmsg_register(void)
@@ -163,4 +186,44 @@ int amdrnpu_rpmsg_register(void)
 void amdrnpu_rpmsg_unregister(void)
 {
 	unregister_rpmsg_driver(&amdrnpu_rpmsg_driver);
+}
+
+int amdrnpu_rpmsg_send_cmd(struct amdrnpu_dev *rnpu, u32 seq,
+			   u32 command_op, u32 flags, const __le64 *args,
+			   u32 num_args)
+{
+	struct rpmsg_device *rpdev;
+	struct amdrnpu_wire_cmd *msg;
+	size_t hdr_off = offsetof(struct amdrnpu_wire_cmd, args);
+	size_t msg_len = hdr_off + (size_t)num_args * sizeof(__le64);
+	int ret;
+
+	if (msg_len > 4096)
+		return -E2BIG;
+
+	mutex_lock(&rnpu->rpmsg_lock);
+	rpdev = rnpu->rpdev;
+	if (!rpdev) {
+		mutex_unlock(&rnpu->rpmsg_lock);
+		return -ENOTCONN;
+	}
+
+	msg = kmalloc(msg_len, GFP_KERNEL);
+	if (!msg) {
+		mutex_unlock(&rnpu->rpmsg_lock);
+		return -ENOMEM;
+	}
+
+	msg->seq         = cpu_to_le32(seq);
+	msg->command_op  = cpu_to_le32(command_op);
+	msg->flags       = cpu_to_le32(flags);
+	msg->num_args    = cpu_to_le32(num_args);
+	if (num_args)
+		memcpy(msg->args, args, num_args * sizeof(__le64));
+
+	ret = rpmsg_send(rpdev->ept, msg, msg_len);
+	mutex_unlock(&rnpu->rpmsg_lock);
+
+	kfree(msg);
+	return ret;
 }

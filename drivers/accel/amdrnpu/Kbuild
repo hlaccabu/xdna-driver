@@ -2,12 +2,20 @@
 #
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 
-ccflags-y += -I$(src)/../../../include/uapi
-ccflags-y += -I$(src)
+ROOT := $(src)
+
+ccflags-y += -I$(ROOT)/
+# uAPI - use -iquote to prioritize local header over in-tree kernel header
+ccflags-y += -iquote$(ROOT)/../../../include/uapi
+
+# All warnings report as errors and keep debug info
+ccflags-y += -g -Werror
 
 obj-m += amdrnpu.o
 
 amdrnpu-y := \
 	amdrnpu_drv.o   \
-	amdrnpu_rpmsg.o \
-	amdrnpu_cmd.o
+	amdrnpu_bank.o  \
+	amdrnpu_drm.o   \
+	amdrnpu_cmd.o   \
+	amdrnpu_rpmsg.o

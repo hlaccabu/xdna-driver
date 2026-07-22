@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 %YAML 1.2
 ---
-$id: http://devicetree.org/schemas/misc/amd,amdrnpu.yaml#
+$id: http://devicetree.org/schemas/accel/amd,amdrnpu.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
 title: AMD amdrnpu - RPU management interface
@@ -19,7 +19,7 @@ description: |
   platform driver is bound only to amd,amdrnpu; Xilinx remoteproc and
   firmware lifecycles remain under the vendor RPU binding.
 
-  Kernel driver role (drivers/accel/tessai-agent, DRM accelerator subsystem):
+  Kernel driver role (drivers/accel/amdrnpu, DRM accelerator subsystem):
 
     - GEM-backed DMA-coherent buffers in two heaps: one window sized for firmware
       and RPU-visible traffic (typically 32-bit DMA), and one for device-side /

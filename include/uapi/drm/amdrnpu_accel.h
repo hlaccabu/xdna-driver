@@ -1,55 +1,141 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note OR MIT */
-/*
- * Copyright (C) 2026, Advanced Micro Devices, Inc.
- */
+
 #ifndef _UAPI_AMDRNPU_ACCEL_H_
 #define _UAPI_AMDRNPU_ACCEL_H_
 
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define AMDRNPU_DEVICE_NAME	"amdrnpu"
-#define AMDRNPU_DEVICE_PATH	"/dev/" AMDRNPU_DEVICE_NAME ".0"
+#if defined(__cplusplus)
+extern "C" {
+#endif
 
-/* Bump on any incompatible change to the structures below. */
+#define AMDRNPU_DRIVER_NAME	"amdrnpu"
 #define AMDRNPU_ABI_VERSION	1
 
-/* Maximum payload (in bytes) carried in a single RPC message. */
-#define AMDRNPU_MAX_PAYLOAD	256
+#ifndef AMDRNPU_IOC_MAGIC
+#define AMDRNPU_IOC_MAGIC			'T'
+#endif
 
-/**
- * struct amdrnpu_msg - generic RPC message exchanged with the RPU.
- * @opcode:   caller-defined operation code
- * @flags:    reserved for future use, must be zero
- * @len:      number of valid bytes in @data
- * @data:     opaque payload
- */
-struct amdrnpu_msg {
-	__u32 opcode;
+enum amdrnpu_memory_type {
+	AMDRNPU_MEMORY_RPU	= 0,
+	AMDRNPU_MEMORY_DEVICE	= 1,
+};
+
+#define AMDRNPU_MEMORY_DEFAULT	AMDRNPU_MEMORY_DEVICE
+
+struct amdrnpu_buf_alloc {
 	__u32 flags;
-	__u32 len;
-	__u8  data[AMDRNPU_MAX_PAYLOAD];
+	__u32 memory_type;
+	__u64 size;
+	__u32 drm_handle;
+	__u32 reserved0;
 };
 
 /**
- * struct amdrnpu_info - driver/ABI information returned to userspace.
- * @abi_version: matches AMDRNPU_ABI_VERSION at build time of the driver
- * @max_payload: maximum payload supported by the driver
+ * enum amdrnpu_buf_sync_dir - cache maintenance before/after device DMA.
+ *
+ * Buffers from AMDRNPU_BUF_ALLOC use cacheable CPU mappings; the CPU must
+ * flush or invalidate explicitly around device access.
+ *
+ * AMDRNPU_BUF_SYNC_TO_DEVICE: CPU wrote the range; flush so the device sees it.
+ * AMDRNPU_BUF_SYNC_FROM_DEVICE: device wrote the range; invalidate before CPU read.
  */
-struct amdrnpu_info {
-	__u32 abi_version;
-	__u32 max_payload;
+enum amdrnpu_buf_sync_dir {
+	AMDRNPU_BUF_SYNC_TO_DEVICE	= 0,
+	AMDRNPU_BUF_SYNC_FROM_DEVICE	= 1,
 };
 
-#define AMDRNPU_IOC_MAGIC	'A'
+/**
+ * struct amdrnpu_buf_sync - partial or full buffer cache sync.
+ *
+ * @drm_handle: GEM handle from AMDRNPU_BUF_ALLOC.
+ * @direction: AMDRNPU_BUF_SYNC_TO_DEVICE or AMDRNPU_BUF_SYNC_FROM_DEVICE.
+ * @offset: byte offset into the buffer (0 = start).
+ * @length: bytes to sync; 0 means from @offset through end-of-buffer.
+ */
+struct amdrnpu_buf_sync {
+	__u32 drm_handle;
+	__u32 direction;
+	__u32 flags;
+	__u64 offset;
+	__u64 length;
+};
 
-/* Query driver/ABI information. */
-#define AMDRNPU_IOC_GET_INFO	_IOR(AMDRNPU_IOC_MAGIC, 0x01, struct amdrnpu_info)
-/* Send a message to the RPU. */
-#define AMDRNPU_IOC_SEND	_IOW(AMDRNPU_IOC_MAGIC, 0x02, struct amdrnpu_msg)
-/* Receive a message from the RPU (blocking until available or O_NONBLOCK). */
-#define AMDRNPU_IOC_RECV	_IOR(AMDRNPU_IOC_MAGIC, 0x03, struct amdrnpu_msg)
-/* Reset internal queues / state. */
-#define AMDRNPU_IOC_RESET	_IO(AMDRNPU_IOC_MAGIC, 0x04)
+/**
+ * struct amdrnpu_arg - one submission argument (scalar or buffer GEM slice).
+ *
+ * Scalar: @size == 0, @value is a QWORD on the wire.
+ * Buffer: @size != 0, @bo resolves to dma_addr / RPU window on the RPMsg side.
+ */
+struct amdrnpu_arg {
+	__u64 size;
+	union {
+		__u64 value;
+		struct {
+			__s32 drm_buffer_handle;
+			__u32 offset;
+		} bo;
+	};
+};
+
+/**
+ * struct amdrnpu_cmd_submit - AMDRNPU_CMD_SUBMIT header plus args[] (flex array).
+ *
+ * drm_sync_obj_handle: zero on entry; on success the kernel returns the
+ * drm_syncobj handle for this submission.  command_op and num_args select the
+ * firmware opcode and the trailing amdrnpu_arg array.  Driver-owned wire seq
+ * is not UAPI; buffer args are resolved to DMA addresses before RPMsg.
+ *
+ * Example (OP_CODE_CMD0, 16 MiB input bo0_hd, 8 MiB output bo1_hd):
+ *
+ *	#define OP_CODE_CMD0	0x00000001u
+ *	#define INPUT_BO	1ull
+ *	#define OUTPUT_BO	2ull
+ *	#define SZ_16M		(16u * 1024u * 1024u)
+ *	#define SZ_8M		(8u * 1024u * 1024u)
+ *
+ *	size_t cmd_len = sizeof(struct amdrnpu_cmd_submit)
+ *			 + 6 * sizeof(struct amdrnpu_arg);
+ *	struct amdrnpu_cmd_submit *cmd = calloc(1, cmd_len);
+ *
+ *	cmd->drm_sync_obj_handle = 0;
+ *	cmd->command_op = OP_CODE_CMD0;
+ *	cmd->num_args = 6;
+ *	cmd->args[0] = (struct amdrnpu_arg){ .size = 0, .value = INPUT_BO };
+ *	cmd->args[1] = (struct amdrnpu_arg){ .size = 0, .value = SZ_16M };
+ *	cmd->args[2] = (struct amdrnpu_arg){
+ *		.size = SZ_16M,
+ *		.bo = { .drm_buffer_handle = (__s32)bo0_hd, .offset = 0 },
+ *	};
+ *	cmd->args[3] = (struct amdrnpu_arg){ .size = 0, .value = OUTPUT_BO };
+ *	cmd->args[4] = (struct amdrnpu_arg){ .size = 0, .value = SZ_8M };
+ *	cmd->args[5] = (struct amdrnpu_arg){
+ *		.size = SZ_8M,
+ *		.bo = { .drm_buffer_handle = (__s32)bo1_hd, .offset = 0 },
+ *	};
+ *	ioctl(drm_fd, AMDRNPU_CMD_SUBMIT, cmd);
+ *
+ * Via libamdrnpu: amdrnpu_cmd_submit(drm_fd, OP_CODE_CMD0,
+ * args, 6, &hdr, sizeof(hdr)) with the same six amdrnpu_arg entries, then
+ * amdrnpu_syncobj_wait_complete() on hdr.drm_sync_obj_handle.
+ */
+struct amdrnpu_cmd_submit {
+	__s32 drm_sync_obj_handle;
+	__u32 command_op;
+	__u32 num_args;
+	struct amdrnpu_arg args[];
+};
+
+#define AMDRNPU_CMD_SUBMIT \
+	_IOWR(AMDRNPU_IOC_MAGIC, 0x20, struct amdrnpu_cmd_submit)
+#define AMDRNPU_BUF_ALLOC \
+	_IOWR(AMDRNPU_IOC_MAGIC, 0x10, struct amdrnpu_buf_alloc)
+#define AMDRNPU_BUF_SYNC \
+	_IOW(AMDRNPU_IOC_MAGIC, 0x11, struct amdrnpu_buf_sync)
+
+#if defined(__cplusplus)
+}
+#endif
 
 #endif /* _UAPI_AMDRNPU_ACCEL_H_ */
