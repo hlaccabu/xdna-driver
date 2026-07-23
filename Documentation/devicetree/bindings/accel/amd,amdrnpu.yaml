@@ -72,14 +72,14 @@ properties:
     description: |
       RPU-facing bank (matches AMDRNPU_MEMORY_RPU in driver UAPI). Buffers shared
       with remoteproc firmware via 32-bit RPU DMA / carveouts carved from DDR.
-      Logical DMA heap backed by dma_alloc_coherent() on its own struct device,
+      Logical DMA heap backed by dma_alloc_noncoherent() on its own struct device,
       instantiated via devm_of_platform_populate() in the amdrnpu parent
       driver and probed by the bank platform_driver. The driver coerces a
       32-bit coherent dma-mask after of_dma_configure().
 
-      The bank intentionally does NOT set dma-coherent: GEM allocations must be
-      non-cacheable normal memory so RPU DMA does not require CPU-side cache
-      maintenance.
+      The bank intentionally does NOT set dma-coherent, so GEM allocations are
+      CPU-cacheable non-coherent DMA and require explicit cache maintenance via
+      AMDRNPU_BUF_SYNC around device access.
 
     properties:
       compatible:

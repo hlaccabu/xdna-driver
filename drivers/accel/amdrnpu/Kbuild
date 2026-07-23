@@ -5,7 +5,6 @@
 ROOT := $(src)
 
 ccflags-y += -I$(ROOT)/
-# uAPI - use -iquote to prioritize local header over in-tree kernel header
 ccflags-y += -iquote$(ROOT)/../../../include/uapi
 
 # All warnings report as errors and keep debug info

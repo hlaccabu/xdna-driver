@@ -97,11 +97,12 @@ static void amdrnpu_cmd_release(struct kref *ref)
 {
 	struct amdrnpu_cmd *cmd = container_of(ref, struct amdrnpu_cmd, ref);
 	struct dma_fence *f;
+	unsigned long flags;
 
-	spin_lock(&cmd->fence_lock);
+	spin_lock_irqsave(&cmd->fence_lock, flags);
 	f = cmd->pending_fence;
 	cmd->pending_fence = NULL;
-	spin_unlock(&cmd->fence_lock);
+	spin_unlock_irqrestore(&cmd->fence_lock, flags);
 	if (f) {
 		dma_fence_set_error(f, -ECONNRESET);
 		dma_fence_signal(f);
@@ -185,15 +186,8 @@ static struct amdrnpu_cmd *amdrnpu_cmd_alloc(struct amdrnpu_dev *rnpu,
 	cmd->seq = AMDRNPU_CMD_SEQ_NONE;
 	cmd->in_cmd_xa = false;
 
-	ret = amdrnpu_cmd_xa_alloc_id(rnpu, cmd);
-	if (ret)
-		goto err_syncobj;
 	return cmd;
 
-err_syncobj:
-	drm_syncobj_put(cmd->syncobj);
-	cmd->syncobj = NULL;
-	dma_fence_put(fence);
 err_free:
 	kfree(cmd);
 	return ERR_PTR(ret);
@@ -303,7 +297,7 @@ void amdrnpu_cmd_dispatch_response(struct amdrnpu_dev *rnpu, const void *payload
 		break;
 	default:
 		drm_err_ratelimited(&rnpu->ddev,
-				    "rpm rsp unexpected command_rsp_type=%u seq=%u; completing with -EREMOTEIO\n",
+				    "rpmsg rsp unexpected command_rsp_type=%u seq=%u; completing with -EREMOTEIO\n",
 				    rsp_type, rsp_seq);
 		term_status = -EREMOTEIO;
 		break;
@@ -313,7 +307,7 @@ void amdrnpu_cmd_dispatch_response(struct amdrnpu_dev *rnpu, const void *payload
 	if (!cmd) {
 		amdrnpu_diag_cmd_take_miss(rnpu, rsp_seq, payload, len, rsp_type);
 		dev_notice_ratelimited(rnpu->dev,
-				       "amdrnpu: rpm rsp dropped (unknown seq %u)\n",
+				       "amdrnpu: rpmsg rsp dropped (unknown seq %u)\n",
 				       rsp_seq);
 		return;
 	}
@@ -341,7 +335,11 @@ void amdrnpu_cmd_release_owner(struct amdrnpu_dev *rnpu, struct drm_file *file)
 				   task_pid_nr(current),
 				   current->comm);
 			cmd->owner = NULL;
-			victim = cmd;
+			victim = xa_erase(&rnpu->cmd_xa, index);
+			if (victim) {
+				victim->in_cmd_xa = false;
+				victim->seq = AMDRNPU_CMD_SEQ_NONE;
+			}
 			break;
 		}
 		mutex_unlock(&rnpu->cmd_lock);
@@ -419,7 +417,8 @@ static int amdrnpu_resolve_args(struct drm_file *file, struct amdrnpu_cmd *cmd,
 			if (!obj)
 				return -ENOENT;
 			bo = to_amdrnpu_gem(obj);
-			if ((u64)a->bo.offset + a->size > bo->size) {
+			if (a->size > bo->size ||
+			    a->bo.offset > bo->size - a->size) {
 				drm_gem_object_put(obj);
 				return -EINVAL;
 			}
@@ -469,6 +468,13 @@ long amdrnpu_ioctl_cmd_submit(struct drm_device *ddev, void __user *uarg,
 		goto out_free_args;
 	}
 
+	/*
+	 * An async RPU response or an rpmsg detach/drain can
+	 * concurrently erase and free cmd; this ref keeps cmd alive while we
+	 * still dereference cmd->seq/cmd->syncobj below.
+	 */
+	kref_get(&cmd->ref);
+
 	if (uhdr.num_args) {
 		cmd->bo_refs = kcalloc(uhdr.num_args, sizeof(*cmd->bo_refs),
 				       GFP_KERNEL);
@@ -485,6 +491,10 @@ long amdrnpu_ioctl_cmd_submit(struct drm_device *ddev, void __user *uarg,
 		if (ret)
 			goto out_finish_cmd;
 	}
+
+	ret = amdrnpu_cmd_xa_alloc_id(rnpu, cmd);
+	if (ret)
+		goto out_finish_cmd;
 
 	ret = amdrnpu_rpmsg_send_cmd(rnpu, cmd->seq, uhdr.command_op, 0,
 				     words, uhdr.num_args);
@@ -511,12 +521,14 @@ long amdrnpu_ioctl_cmd_submit(struct drm_device *ddev, void __user *uarg,
 		    task_pid_nr(current),
 		    current->comm);
 
+	amdrnpu_cmd_put(cmd);
 	kvfree(words);
 	kvfree(args);
 	return 0;
 
 out_finish_cmd:
 	amdrnpu_cmd_finish(rnpu, cmd, ret < 0 ? (int)ret : -EIO);
+	amdrnpu_cmd_put(cmd);
 	kvfree(words);
 out_free_args:
 	kvfree(args);

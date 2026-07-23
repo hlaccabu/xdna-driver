@@ -63,7 +63,7 @@ struct amdrnpu_bank {
 
 struct amdrnpu_dev {
 	struct drm_device	ddev;
-	struct device		*dev; /* Refcounted target of "amd,remoteproc". */
+	struct device		*dev;
 	struct device_node	*linked_rproc;
 
 	struct amdrnpu_bank	banks[AMDRNPU_NUM_BANKS];

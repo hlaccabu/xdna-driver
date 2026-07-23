@@ -9,12 +9,15 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_mode.h>
+#include <drm/drm_prime.h>
+#include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/fs.h>
 #include <linux/iosys-map.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/pagemap.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
@@ -50,9 +53,12 @@ static void amdrnpu_gem_free(struct drm_gem_object *obj)
 {
 	struct amdrnpu_gem *bo = to_amdrnpu_gem(obj);
 
-	if (bo->kvaddr)
+	if (obj->import_attach) {
+		drm_prime_gem_destroy(obj, bo->sgt);
+	} else if (bo->kvaddr) {
 		dma_free_noncoherent(bo->bank->dev, bo->size,
 				     bo->kvaddr, bo->dma_addr, bo->dma_dir);
+	}
 
 	drm_gem_object_release(obj);
 	kfree(bo);
@@ -65,6 +71,11 @@ static int amdrnpu_gem_obj_mmap(struct drm_gem_object *obj,
 	unsigned long pgoff = vma->vm_pgoff - drm_vma_node_start(&obj->vma_node);
 	unsigned long vpages = vma_pages(vma);
 	unsigned long bopages = bo->size >> PAGE_SHIFT;
+
+	if (obj->import_attach) {
+		vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
+		return dma_buf_mmap(obj->dma_buf, vma, 0);
+	}
 
 	if (pgoff >= bopages || vpages > bopages - pgoff)
 		return -EINVAL;
@@ -85,10 +96,20 @@ static int amdrnpu_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map)
 {
 	struct amdrnpu_gem *bo = to_amdrnpu_gem(obj);
 
+	if (obj->import_attach)
+		return dma_buf_vmap(obj->dma_buf, map);
+
 	if (!bo->kvaddr)
 		return -ENOMEM;
 	iosys_map_set_vaddr(map, bo->kvaddr);
 	return 0;
+}
+
+static void amdrnpu_gem_vunmap(struct drm_gem_object *obj, struct iosys_map *map)
+{
+	if (obj->import_attach)
+		dma_buf_vunmap(obj->dma_buf, map);
+	/* Native buffers keep a persistent kvaddr; nothing to tear down. */
 }
 
 static struct sg_table *amdrnpu_gem_get_sg_table(struct drm_gem_object *obj)
@@ -96,6 +117,9 @@ static struct sg_table *amdrnpu_gem_get_sg_table(struct drm_gem_object *obj)
 	struct amdrnpu_gem *bo = to_amdrnpu_gem(obj);
 	struct sg_table *sgt;
 	int ret;
+
+	if (obj->import_attach)
+		return ERR_PTR(-EINVAL);
 
 	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
 	if (!sgt)
@@ -115,8 +139,58 @@ static const struct drm_gem_object_funcs amdrnpu_gem_funcs = {
 	.mmap		= amdrnpu_gem_obj_mmap,
 	.vm_ops		= &amdrnpu_gem_vm_ops,
 	.vmap		= amdrnpu_gem_vmap,
+	.vunmap		= amdrnpu_gem_vunmap,
 	.get_sg_table	= amdrnpu_gem_get_sg_table,
+	.export		= drm_gem_prime_export,
 };
+
+/*
+ * Imported dma-bufs are placed in the device bank so the RPU sees a valid
+ * device address; the exporter owns the backing pages and cache management.
+ */
+static struct drm_gem_object *
+amdrnpu_gem_prime_import_sg_table(struct drm_device *ddev,
+				  struct dma_buf_attachment *attach,
+				  struct sg_table *sgt)
+{
+	struct amdrnpu_dev *rnpu = to_amdrnpu_dev(ddev);
+	struct amdrnpu_bank *bank;
+	struct amdrnpu_gem *bo;
+	int ret;
+
+	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
+	if (!bo)
+		return ERR_PTR(-ENOMEM);
+
+	bank = amdrnpu_bank_by_region(rnpu, AMDRNPU_BANK_DEV);
+	if (!bank) {
+		kfree(bo);
+		return ERR_PTR(-ENODEV);
+	}
+
+	bo->base.funcs = &amdrnpu_gem_funcs;
+	bo->bank = bank;
+	bo->size = attach->dmabuf->size;
+	bo->sgt = sgt;
+
+	/*
+	 * The RPU consumes a single base device address (bo->dma_addr + offset);
+	 * it cannot follow a fragmented sg-table. Reject imports whose DMA
+	 * mapping is not contiguous for the whole buffer.
+	 */
+	if (drm_prime_get_contiguous_size(sgt) < bo->size) {
+		kfree(bo);
+		return ERR_PTR(-EINVAL);
+	}
+	bo->dma_addr = sg_dma_address(sgt->sgl);
+
+	ret = drm_gem_object_init(ddev, &bo->base, bo->size);
+	if (ret) {
+		kfree(bo);
+		return ERR_PTR(ret);
+	}
+	return &bo->base;
+}
 
 static int amdrnpu_buf_alloc(struct drm_device *ddev, struct amdrnpu_buf_alloc *args,
 			     struct drm_file *file)
@@ -343,6 +417,8 @@ const struct drm_driver amdrnpu_drm_driver = {
 
 	.dumb_create		= amdrnpu_dumb_create,
 	.dumb_map_offset	= drm_gem_dumb_map_offset,
+
+	.gem_prime_import_sg_table = amdrnpu_gem_prime_import_sg_table,
 
 	.name			= AMDRNPU_DRV_NAME,
 	.desc			= "AMD RNPU DRM implementation",

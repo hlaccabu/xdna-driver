@@ -11,6 +11,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 
 #include "amdrnpu_internal.h"
 
@@ -139,3 +140,13 @@ MODULE_AUTHOR("AMD");
 MODULE_DESCRIPTION("AMD amdrnpu RPU management DRM/RPMsg driver");
 MODULE_LICENSE("GPL v2");
 MODULE_VERSION("0.1.0");
+/*
+ * dma_buf_* helpers were moved into the DMA_BUF symbol namespace in
+ * Linux 6.6; importing it here keeps modpost happy on 6.12 and newer.
+ * The namespace argument became a string literal in Linux 6.13.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("DMA_BUF");
+#else
+MODULE_IMPORT_NS(DMA_BUF);
+#endif
