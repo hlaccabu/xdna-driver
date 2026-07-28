@@ -22,6 +22,7 @@ Options:
   -npu3a                   Use iommu bypass magic to FW on npu3a attach
   -dir                     Download directory if apply
   -nokmod                  Don't build or install the kernel module
+  -rnpu                    Build only the amdrnpu driver + lib (arm64 host)
   -novxdna                 Don't build vxdna library
   -vxdna_test              Build and run vxdna unit tests (-novxdna disable this option)
   -package_legacy_driver   Build package with legacy driver source code
@@ -230,6 +231,67 @@ do_build()
   fi
 }
 
+# Build ONLY the amdrnpu kernel driver and its userspace lib. Host is assumed to be arm64, 
+# no cross-compile.
+build_rnpu()
+{
+  BUILD_TYPE=$1
+
+  local rnpu_drv_src=${BUILD_DIR}/../drivers/accel/amdrnpu
+  local rnpu_inc_src=${BUILD_DIR}/../include
+  local rnpu_lib_src=${BUILD_DIR}/../src/amdrnpu
+
+  # Build against the host running kernel unless the caller
+  # points KERNEL_SRC/KDIR at a specific tree.
+  local kdir=${KERNEL_SRC:-${KDIR:-/lib/modules/$(uname -r)/build}}
+  if [ ! -d "$kdir" ]; then
+    echo "ERROR: kernel build tree not found at '$kdir'."
+    echo "       Install matching kernel headers or set KERNEL_SRC=/path/to/linux."
+    exit 1
+  fi
+
+  echo ""
+  echo "========================================"
+  echo "Building amdrnpu driver + lib ($BUILD_TYPE)"
+  echo "  KDIR=$kdir"
+  echo "========================================"
+  echo ""
+
+  mkdir -p $BUILD_TYPE
+
+  local drv_bld=$BUILD_TYPE/drivers/accel/amdrnpu
+  rm -rf $drv_bld
+  mkdir -p $BUILD_TYPE/drivers/accel
+  cp -rf $rnpu_drv_src $BUILD_TYPE/drivers/accel/
+  rm -rf $BUILD_TYPE/include
+  cp -rf $rnpu_inc_src $BUILD_TYPE/include
+
+  local kverbose=""
+  if [[ -n "$verbose" ]]; then kverbose="V=1"; fi
+  time make -j $njobs -C "$kdir" M=$(readlink -f $drv_bld) $kverbose modules
+
+  mkdir -p $BUILD_TYPE/driver $BUILD_TYPE/bins/driver
+  cp -f $drv_bld/amdrnpu.ko $BUILD_TYPE/driver/amdrnpu.ko
+  cp -f $drv_bld/amdrnpu.ko $BUILD_TYPE/bins/driver/amdrnpu.ko
+
+  # --- Userspace lib ---
+  local lib_bld=$BUILD_TYPE/amdrnpu_lib
+  mkdir -p $lib_bld
+  local lverbose=""
+  if [[ -n "$verbose" ]]; then lverbose="VERBOSE=1"; fi
+  time $CMAKE -S $rnpu_lib_src -B $lib_bld -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+  time make -j $njobs -C $lib_bld $lverbose
+
+  mkdir -p $BUILD_TYPE/bins/lib
+  cp -a $lib_bld/libamdrnpu.so* $BUILD_TYPE/bins/lib/
+
+  echo ""
+  echo "amdrnpu build complete ($BUILD_TYPE):"
+  echo "  driver: $BUILD_TYPE/driver/amdrnpu.ko"
+  echo "  driver: $BUILD_TYPE/bins/driver/amdrnpu.ko"
+  echo "  lib:    $BUILD_TYPE/bins/lib/"
+}
+
 # Config variables
 clean=0
 distclean=0
@@ -238,6 +300,7 @@ release=0
 nocmake=0
 verbose=
 skip_kmod=0
+rnpu=0
 build_vxdna=1
 run_vxdna_tests=0
 package_legacy_driver=0
@@ -287,6 +350,9 @@ while [ $# -gt 0 ]; do
       ;;
     -nokmod)
       skip_kmod=1
+      ;;
+    -rnpu)
+      rnpu=1
       ;;
     -novxdna)
       build_vxdna=0
@@ -359,6 +425,16 @@ if [[ $clean == 1 ]]; then
   rm -rf $DEBUG_BUILD_TYPE $RELEASE_BUILD_TYPE
   if [[ $distclean == 1 ]]; then
     rm -rf ${DOWNLOAD_BINS_DIR}
+  fi
+  exit 0
+fi
+
+# -rnpu is exclusive: build only the amdrnpu driver + lib
+if [[ $rnpu == 1 ]]; then
+  if [[ $release == 1 ]]; then
+    build_rnpu $RELEASE_BUILD_TYPE
+  else
+    build_rnpu $DEBUG_BUILD_TYPE
   fi
   exit 0
 fi
