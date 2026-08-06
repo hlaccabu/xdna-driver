@@ -9,6 +9,7 @@
 #include "aie4_msg_priv.h"
 #include "aie4_pci.h"
 #include "amdxdna_pci_drv.h"
+#include "amdxdna_sensors.h"
 
 #define NPU3_MBOX_BAR		0
 
@@ -101,6 +102,20 @@ static int npu3_update_counters(struct aie_device *aie)
 	u32 aieclk_level, npuhclk_level;
 	int ret;
 
+#ifdef HAVE_7_2_amd_pmf_npu_metrics_npu_temp
+	struct amdxdna_sensors npu_metrics;
+
+	ret = amdxdna_get_sensors(&npu_metrics);
+	if (!ret) {
+		aie->npuclk_freq = npu_metrics.mpnpuclk_freq;
+		aie->hclk_freq = npu_metrics.npuclk_freq;
+		aie->max_tops = NPU3_DPM_TOPS(ndev, ndev->dpm_clk_tbl[ndev->max_dpm_level].hclk);
+		aie->curr_tops = NPU3_DPM_TOPS(ndev, aie->hclk_freq);
+	} else {
+		XDNA_WARN(aie->xdna, "cannot get pmf npu metrics");
+		return ret;
+	}
+#else
 	ret = aie4_query_dpm_level(ndev, &aieclk_level, &npuhclk_level);
 	if (!ret) {
 		aie->npuclk_freq = ndev->dpm_clk_tbl[aieclk_level].npuclk;
@@ -113,6 +128,7 @@ static int npu3_update_counters(struct aie_device *aie)
 	}
 
 	aie->curr_tops = NPU3_DPM_TOPS(ndev, aie->hclk_freq);
+#endif
 
 	return 0;
 }
