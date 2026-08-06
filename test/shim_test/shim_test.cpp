@@ -1875,7 +1875,7 @@ std::vector<test_case> test_list {
     TEST_POSITIVE, dev_filter_is_npu4_and_amdxdna_drv, TEST_dpm_refcount_scaling, {}
   },
   test_case{ "DPM power modes", {},
-    TEST_POSITIVE, dev_filter_is_npu4_and_amdxdna_drv, TEST_dpm_power_modes, {}
+    TEST_POSITIVE, dev_filter_is_aie4_or_npu4_and_amdxdna_drv, TEST_dpm_power_modes, {}
   },
   test_case{ "CERT log: attach/detach", {},
     TEST_POSITIVE, dev_filter_is_aie4, TEST_certlog_attach_detach, {}

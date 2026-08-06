@@ -478,6 +478,9 @@ const dpm_clk_entry npu4_dpm_table[] = {
   {1267, 1800},
 };
 
+const uint32_t npu3_hclk_table[] = { 400, 960, 1108, 1200 };
+constexpr int NPU3_HCLK_LEVELS = 4;
+
 constexpr int DPM_NUM_LEVELS = 8;
 constexpr uint32_t HCLK_MARGIN_PCT = 2;
 constexpr uint32_t DPM_COL_OPC = 4096;
@@ -1658,9 +1661,20 @@ void
 TEST_dpm_power_modes(device::id_type id, std::shared_ptr<device>& sdev, arg_type& arg)
 {
   auto dev = sdev.get();
-  uint32_t max_hclk = npu4_dpm_table[DPM_NUM_LEVELS - 1].hclk;
-  uint32_t low_hclk = npu4_dpm_table[0].hclk;
-  uint32_t med_hclk = npu4_dpm_table[DPM_NUM_LEVELS / 2].hclk;
+
+  auto pci_dev_id = canonical_device_id(device_query<query::pcie_device>(dev));
+  const bool is_aie4 = (pci_dev_id != npu4_device_id);
+
+  uint32_t low_hclk, med_hclk, max_hclk;
+  if (is_aie4) {
+    low_hclk = npu3_hclk_table[0];
+    med_hclk = npu3_hclk_table[1];
+    max_hclk = npu3_hclk_table[NPU3_HCLK_LEVELS - 1];
+  } else {
+    low_hclk = npu4_dpm_table[0].hclk;
+    med_hclk = npu4_dpm_table[DPM_NUM_LEVELS / 2].hclk;
+    max_hclk = npu4_dpm_table[DPM_NUM_LEVELS - 1].hclk;
+  }
 
   set_power_mode(dev, POWER_MODE_TURBO);
   // The turbo H-clock legitimately runs above the DPM table maximum on real
