@@ -417,6 +417,25 @@ struct amdxdna_hwctx_status_ctx {
 static_assert(offsetof(struct amdxdna_hwctx_status_ctx, key) == 0,
 	      "key must be the first member for amdxdna_hwctx_match()");
 
+static bool amdxdna_hwctx_is_runtime_idle(struct amdxdna_hwctx *hwctx)
+{
+	u64 submitted = atomic64_read(&hwctx->job_submit_cnt);
+	u64 completed = atomic64_read(&hwctx->job_free_cnt);
+
+	return submitted == completed;
+}
+
+static u32 amdxdna_hwctx_report_state(struct amdxdna_hwctx *hwctx)
+{
+	if (hwctx->fw_ctx_id == (u32)-1)
+		return AMDXDNA_HWCTX_STATE_IDLE;
+
+	if (amdxdna_hwctx_is_runtime_idle(hwctx))
+		return AMDXDNA_HWCTX_STATE_IDLE;
+
+	return AMDXDNA_HWCTX_STATE_ACTIVE;
+}
+
 static int amdxdna_fill_hwctx_status_entry(struct aie_device *aie,
 					   struct amdxdna_hwctx *hwctx,
 					   struct amdxdna_drm_get_array *array_args)
@@ -453,7 +472,7 @@ static int amdxdna_fill_hwctx_status_entry(struct aie_device *aie,
 	tmp->dma_bandwidth = hwctx->qos.dma_bandwidth;
 	tmp->latency = hwctx->qos.latency;
 	tmp->frame_exec_time = hwctx->qos.frame_exec_time;
-	tmp->state = AMDXDNA_HWCTX_STATE_ACTIVE;
+	tmp->state = amdxdna_hwctx_report_state(hwctx);
 
 	/* Optional FW health is best-effort; ignore errors. */
 	if (aie->msg_ops.fill_hwctx_health)
