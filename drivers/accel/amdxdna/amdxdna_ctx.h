@@ -199,7 +199,10 @@ struct amdxdna_hwctx {
 	atomic64_t			job_free_cnt ____cacheline_aligned_in_smp;
 	wait_queue_head_t		job_free_wq;
 
-	/* Saved core dump, captured automatically on timeout if device auto_coredump is set. */
+	/*
+	 * Saved core dump if auto_coredump is set: AIE2 on timeout, AIE4 on firmware
+	 * context-error recovery.
+	 */
 	char				*coredump;
 };
 

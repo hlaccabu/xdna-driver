@@ -1102,9 +1102,11 @@ struct amdxdna_drm_set_state {
 	 * DRM_ROOT_ONLY).
 	 *
 	 * %DRM_AMDXDNA_SET_AUTO_COREDUMP:
-	 * Controls automatic AIE tile core dump capture on timeout.
+	 * Controls automatic AIE tile core dump capture into the
+	 * hardware context.
 	 * 0 - disable auto core dump capture.
-	 * 1 - capture a core dump into the hardware context on timeout.
+	 * 1 - capture a core dump on job timeout (AIE2) or firmware
+	 * context-error recovery (AIE4).
 	 */
 	__u32 param;
 	/**

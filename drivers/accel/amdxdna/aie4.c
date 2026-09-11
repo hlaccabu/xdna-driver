@@ -110,6 +110,7 @@ int aie4_query_fw(struct amdxdna_dev_hdl *ndev)
 
 	aie4_restore_power_mode(ndev);
 	aie4_restore_force_preemption(ndev);
+	aie4_restore_hws_debug_mode(ndev);
 
 	return 0;
 }
@@ -622,6 +623,39 @@ static int aie4_set_force_preempt_state(struct amdxdna_client *client,
 	return 0;
 }
 
+/*
+ * Auto coredump on AIE4 is firmware HWS debug mode ARM_ON_ERROR, not a
+ * driver-side timeout hook. Firmware ignores ctx_id for DISABLE and
+ * ARM_ON_ERROR, so pass 0.
+ */
+static int aie4_set_auto_coredump(struct amdxdna_client *client,
+				  struct amdxdna_drm_set_state *args)
+{
+	struct amdxdna_dev_hdl *ndev = client->xdna->dev_handle;
+	struct amdxdna_drm_attribute_state state = {};
+	u32 buf_sz;
+	u8 mode;
+	int ret;
+
+	buf_sz = min(args->buffer_size, sizeof(state));
+	if (copy_from_user(&state, u64_to_user_ptr(args->buffer), buf_sz))
+		return -EFAULT;
+
+	if (state.state > 1)
+		return -EINVAL;
+
+	if (XDNA_MBZ_DBG(client->xdna, state.pad, sizeof(state.pad)))
+		return -EINVAL;
+
+	mode = state.state ? AIE4_HWS_DEBUG_MODE_ARM_ON_ERROR
+			    : AIE4_HWS_DEBUG_MODE_DISABLE;
+	ret = aie4_configure_hws_debug_mode(ndev, mode);
+	if (ret)
+		return ret;
+
+	return amdxdna_set_auto_coredump_state(client, state.state);
+}
+
 int aie4_set_state(struct amdxdna_client *client,
 		   struct amdxdna_drm_set_state *args, u32 *settle_ms)
 {
@@ -653,10 +687,7 @@ int aie4_set_state(struct amdxdna_client *client,
 		ret = amdxdna_set_fw_trace_state(&ndev->aie, args);
 		break;
 	case DRM_AMDXDNA_SET_AUTO_COREDUMP:
-		/* TODO: enable debug mode on FW if auto coredump is enabled,
-		 * then call amdxdna_set_auto_coredump_mode(client, args).
-		 */
-		ret = -EOPNOTSUPP;
+		ret = aie4_set_auto_coredump(client, args);
 		break;
 	default:
 		XDNA_ERR(xdna, "Not supported request parameter %u", args->param);

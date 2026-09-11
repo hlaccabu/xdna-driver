@@ -30,6 +30,7 @@ char *amdxdna_get_hwctx_coredump(struct aie_device *aie,
 				 struct amdxdna_hwctx *hwctx);
 int amdxdna_get_auto_coredump_mode(struct amdxdna_client *client,
 				   struct amdxdna_drm_get_info *args);
+int amdxdna_set_auto_coredump_state(struct amdxdna_client *client, u32 enabled);
 int amdxdna_set_auto_coredump_mode(struct amdxdna_client *client,
 				   struct amdxdna_drm_set_state *args);
 
