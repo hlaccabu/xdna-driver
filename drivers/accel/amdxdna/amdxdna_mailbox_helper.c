@@ -19,7 +19,6 @@
 int xdna_msg_cb(void *handle, void __iomem *data, size_t size)
 {
 	struct xdna_notify *cb_arg = handle;
-	int ret;
 
 	/*
 	 * A NULL handle means no sender is waiting on this message -- there is
@@ -39,18 +38,33 @@ int xdna_msg_cb(void *handle, void __iomem *data, size_t size)
 	if (unlikely(!data))
 		goto out;
 
-	if (unlikely(cb_arg->size != size)) {
-		cb_arg->error = -EINVAL;
+	/*
+	 * Firmware may return only the status word for a failed command even
+	 * when the success response has additional payload.  Copy that compact
+	 * error response so the command layer can report its status normally.
+	 *
+	 * A short successful response is malformed because its payload is
+	 * missing.  Fail only the waiting request in that case.  In particular,
+	 * do not return the request error to the mailbox RX worker: callback
+	 * validation failure is not ring corruption and must not permanently
+	 * mark the channel bad.
+	 */
+	if (unlikely(size < sizeof(*cb_arg->status) || size > cb_arg->size)) {
+		cb_arg->error = -EMSGSIZE;
 		goto out;
 	}
 
-	memcpy_fromio(cb_arg->data, data, cb_arg->size);
+	memcpy_fromio(cb_arg->data, data, size);
 	print_hex_dump_debug("resp data: ", DUMP_PREFIX_OFFSET,
-			     16, 4, cb_arg->data, cb_arg->size, true);
+			     16, 4, cb_arg->data, size, true);
+
+	if (unlikely(size != cb_arg->size && !*cb_arg->status))
+		cb_arg->error = -EMSGSIZE;
 out:
-	ret = cb_arg->error;
 	complete(&cb_arg->comp);
-	return ret;
+
+	/* Request errors are delivered through cb_arg, not as RX transport errors. */
+	return 0;
 }
 
 int xdna_send_msg_wait(struct amdxdna_dev *xdna, struct mailbox_channel *chann,
