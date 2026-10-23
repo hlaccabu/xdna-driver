@@ -137,10 +137,35 @@ void amdxdna_pm_init(struct amdxdna_dev *xdna)
 {
 	struct device *dev = xdna->ddev.dev;
 
+	/*
+	 * PCI core often enables RPM before the driver's probe finishes; the
+	 * platform bus does not. Without pm_runtime_enable(), sysfs reports
+	 * runtime_status=unsupported and autosuspend never fires.
+	 *
+	 * ops->init() runs under xdna->dev_lock, and runtime_suspend takes
+	 * that same lock. set_autosuspend_delay / allow / put can all enter
+	 * rpm_idle -> runtime_suspend from this context (seen hanging
+	 * insmod in D-state on amdxdna_pm_runtime_suspend). Hold a temporary
+	 * usage ref across setup so idle cannot run; amdxdna_pm_autosuspend()
+	 * drops it after probe has released dev_lock.
+	 */
+	pm_runtime_get_noresume(dev);
 	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
 	pm_runtime_set_autosuspend_delay(dev, AMDXDNA_AUTOSUSPEND_DELAY);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_allow(dev);
+	pm_runtime_mark_last_busy(dev);
+}
+
+void amdxdna_pm_autosuspend(struct amdxdna_dev *xdna)
+{
+	struct device *dev = xdna->ddev.dev;
+
+	if (!pm_runtime_enabled(dev))
+		return;
+
+	/* Drop the probe-time get_noresume from amdxdna_pm_init(). */
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
 }
@@ -151,4 +176,6 @@ void amdxdna_pm_fini(struct amdxdna_dev *xdna)
 
 	pm_runtime_get_noresume(dev);
 	pm_runtime_forbid(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	pm_runtime_disable(dev);
 }
