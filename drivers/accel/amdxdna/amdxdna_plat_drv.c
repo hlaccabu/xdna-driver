@@ -261,6 +261,8 @@ static int amdxdna_plat_probe(struct platform_device *pdev)
 	}
 
 	amdxdna_debugfs_init(xdna);
+	/* RPM idle only after ops->init dropped dev_lock (see amdxdna_pm_init). */
+	amdxdna_pm_autosuspend(xdna);
 	XDNA_INFO(xdna, "amdxdna platform device probed");
 	return 0;
 

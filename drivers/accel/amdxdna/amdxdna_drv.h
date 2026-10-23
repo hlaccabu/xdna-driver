@@ -227,6 +227,13 @@ struct amdxdna_dev {
 	/* Allow auto core dump for hardware contexts, if true. */
 	bool				auto_coredump;
 
+	/*
+	 * True if amdxdna_pm_init() called pm_runtime_enable(). PCI core
+	 * already enables RPM; platform does not. Only disable in fini when
+	 * this driver enabled it.
+	 */
+	bool				rpm_enabled_by_drv;
+
 	/* Back-pointer to the per-generation aie_device, set at DPT init so
 	 * common code (e.g. debugfs) can reach msg_ops without knowing the
 	 * generation-specific struct amdxdna_dev_hdl layout.
