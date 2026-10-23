@@ -17,6 +17,7 @@
  */
 
 #include <drm/drm_managed.h>
+#include <linux/pm_runtime.h>
 
 #include "aie.h"
 #include "aie4.h"
@@ -27,7 +28,8 @@
 #include "amdxdna_error.h"
 #include "amdxdna_mailbox.h"
 #include "amdxdna_mailbox_plat.h"
-#include "amdxdna_pm.h"
+
+#define AIE4_PLAT_AUTOSUSPEND_DELAY_MS	5000
 
 /*
  * Transport hooks (mirror the aie4_pci.c definitions).  The shared aie4_ctx.c
@@ -250,13 +252,14 @@ static int aie4_plat_init(struct amdxdna_dev *xdna)
 	/*
 	 * Shared post-bring-up init, mirroring the PCI aie4_xdna_init(): msg_init
 	 * installs the status/telemetry/health/coredump handlers and the hwctx
-	 * limit, dpt_init brings up firmware-log/DPT services, pm_init enables
-	 * runtime PM, and vbnv_init publishes the device VBNV. dpt_init is
-	 * best-effort (the PCI path ignores its return too).
+	 * limit, dpt_init brings up firmware-log/DPT services, and vbnv_init
+	 * publishes the device VBNV. dpt_init is best-effort (the PCI path
+	 * ignores its return too). Runtime PM uses aie4_plat_pm_* instead of
+	 * amdxdna_pm_init so PCI shared PM is untouched.
 	 */
 	aie4_msg_init(ndev);
 	amdxdna_dpt_init(&ndev->aie);
-	amdxdna_pm_init(xdna);
+	aie4_plat_pm_init(xdna);
 	amdxdna_vbnv_init(xdna);
 
 	return 0;
@@ -277,12 +280,53 @@ free_work_buf:
 	return ret;
 }
 
+void aie4_plat_pm_init(struct amdxdna_dev *xdna)
+{
+	struct device *dev = xdna->ddev.dev;
+
+	/*
+	 * Platform bus does not enable RPM for us. Hold a temporary usage ref
+	 * across setup so set_autosuspend_delay/allow cannot enter rpm_idle ->
+	 * runtime_suspend while ops->init still holds dev_lock (same lock
+	 * runtime_suspend takes). aie4_plat_pm_allow_idle() drops the ref at
+	 * the end of amdxdna_plat_probe after the lock is released.
+	 */
+	pm_runtime_get_noresume(dev);
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+	pm_runtime_set_autosuspend_delay(dev, AIE4_PLAT_AUTOSUSPEND_DELAY_MS);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_allow(dev);
+	pm_runtime_mark_last_busy(dev);
+}
+
+void aie4_plat_pm_allow_idle(struct amdxdna_dev *xdna)
+{
+	struct device *dev = xdna->ddev.dev;
+
+	if (!pm_runtime_enabled(dev))
+		return;
+
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+}
+
+void aie4_plat_pm_fini(struct amdxdna_dev *xdna)
+{
+	struct device *dev = xdna->ddev.dev;
+
+	pm_runtime_get_noresume(dev);
+	pm_runtime_forbid(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	pm_runtime_disable(dev);
+}
+
 static void aie4_plat_fini(struct amdxdna_dev *xdna)
 {
 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 
 	/* Mirror the PCI aie4_xdna_fini(); dpt_fini needs the mailbox still up. */
-	amdxdna_pm_fini(xdna);
+	aie4_plat_pm_fini(xdna);
 	amdxdna_dpt_fini(&ndev->aie);
 
 	/*
