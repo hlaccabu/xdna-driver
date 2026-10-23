@@ -206,6 +206,8 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	amdxdna_debugfs_init(xdna);
 	amdxdna_hwmon_init(xdna);
+	/* RPM idle only after ops->init dropped dev_lock (see amdxdna_pm_init). */
+	amdxdna_pm_autosuspend(xdna);
 	return 0;
 
 failed_sysfs_fini:
