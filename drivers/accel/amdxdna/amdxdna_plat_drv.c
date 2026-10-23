@@ -27,6 +27,7 @@
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 
+#include "aie4_plat.h"
 #include "amdxdna_cbuf.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_debugfs.h"
@@ -261,6 +262,8 @@ static int amdxdna_plat_probe(struct platform_device *pdev)
 	}
 
 	amdxdna_debugfs_init(xdna);
+	/* Drop plat probe-time RPM ref after ops->init released dev_lock. */
+	aie4_plat_pm_allow_idle(xdna);
 	XDNA_INFO(xdna, "amdxdna platform device probed");
 	return 0;
 
