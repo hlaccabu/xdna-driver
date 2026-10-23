@@ -5,6 +5,7 @@
 
 #include "drm/amdxdna_accel.h"
 #include <drm/drm_drv.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 
 #include "amdxdna_dpt.h"
@@ -136,12 +137,32 @@ void amdxdna_pm_suspend_put(struct amdxdna_dev *xdna)
 void amdxdna_pm_init(struct amdxdna_dev *xdna)
 {
 	struct device *dev = xdna->ddev.dev;
+	bool need_enable = dev_is_platform(dev) && !pm_runtime_enabled(dev);
+
+	/*
+	 * PCI core enables RPM before probe and holds a usage ref from
+	 * local_pci_probe()'s get_sync, which the put below drops. The
+	 * platform bus does not enable RPM, so without pm_runtime_enable()
+	 * sysfs reports unsupported and autosuspend never fires; take our
+	 * own ref for the put below to balance.
+	 *
+	 * This runs under xdna->dev_lock, which runtime_suspend also takes.
+	 * The held ref keeps rpm_idle from suspending synchronously during
+	 * setup, and marking last busy before autosuspend is configured
+	 * makes the final put only arm the autosuspend timer.
+	 */
+	if (need_enable)
+		pm_runtime_get_noresume(dev);
 
 	pm_runtime_set_active(dev);
+	if (need_enable)
+		pm_runtime_enable(dev);
+	xdna->rpm_enabled_by_drv = need_enable;
+
+	pm_runtime_mark_last_busy(dev);
 	pm_runtime_set_autosuspend_delay(dev, AMDXDNA_AUTOSUSPEND_DELAY);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_allow(dev);
-	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
 }
 
@@ -149,6 +170,11 @@ void amdxdna_pm_fini(struct amdxdna_dev *xdna)
 {
 	struct device *dev = xdna->ddev.dev;
 
-	pm_runtime_get_noresume(dev);
+	/* Restore the ref pci_device_remove() drops; other buses drop none. */
+	if (!xdna->rpm_enabled_by_drv)
+		pm_runtime_get_noresume(dev);
 	pm_runtime_forbid(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	if (xdna->rpm_enabled_by_drv)
+		pm_runtime_disable(dev);
 }

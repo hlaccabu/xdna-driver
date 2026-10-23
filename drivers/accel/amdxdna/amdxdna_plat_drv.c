@@ -24,6 +24,7 @@
 #include <linux/of_device.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 
@@ -268,9 +269,11 @@ static int amdxdna_plat_probe(struct platform_device *pdev)
 failed_sysfs_fini:
 	amdxdna_sysfs_fini(xdna);
 failed_dev_fini:
+	pm_runtime_get_sync(dev);
 	mutex_lock(&xdna->dev_lock);
 	xdna->dev_info->ops->fini(xdna);
 	mutex_unlock(&xdna->dev_lock);
+	pm_runtime_put_noidle(dev);
 	return ret;
 }
 
@@ -278,6 +281,9 @@ static void amdxdna_plat_remove(struct platform_device *pdev)
 {
 	struct amdxdna_dev *xdna = platform_get_drvdata(pdev);
 	struct amdxdna_client *client;
+
+	/* Resume before taking dev_lock, as PCI core does before remove. */
+	pm_runtime_get_sync(&pdev->dev);
 
 	drm_dev_unplug(&xdna->ddev);
 	amdxdna_sysfs_fini(xdna);
@@ -292,10 +298,28 @@ static void amdxdna_plat_remove(struct platform_device *pdev)
 	xdna->dev_info->ops->fini(xdna);
 	mutex_unlock(&xdna->dev_lock);
 	mutex_unlock(&xdna->client_lock);
+
+	pm_runtime_put_noidle(&pdev->dev);
+}
+
+static int amdxdna_plat_suspend(struct device *dev)
+{
+	int ret;
+
+	/*
+	 * Unlike PCI, the platform bus does not resume a runtime-suspended
+	 * device before system sleep. Do it here so hardware contexts are not
+	 * suspended twice and runtime PM stays enabled for the suspend path.
+	 */
+	ret = pm_runtime_resume(dev);
+	if (ret < 0)
+		return ret;
+
+	return amdxdna_pm_suspend(dev);
 }
 
 static const struct dev_pm_ops amdxdna_plat_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(amdxdna_pm_suspend, amdxdna_pm_resume)
+	SYSTEM_SLEEP_PM_OPS(amdxdna_plat_suspend, amdxdna_pm_resume)
 	RUNTIME_PM_OPS(amdxdna_pm_runtime_suspend, amdxdna_pm_runtime_resume, NULL)
 };
 
