@@ -105,7 +105,15 @@ struct amdxdna_dev_ops {
 
 	/* Asynchronous error reporting callbacks. */
 	int (*register_async_event)(struct aie_device *aie, dma_addr_t addr, u32 size,
-				    void *handle, int (*cb)(void *, void __iomem *, size_t));
+				    void *handle, int (*cb)(void *, void __iomem *, size_t),
+				    u32 *msg_id);
+	/*
+	 * Wait again for a registration firmware kept across a mailbox
+	 * teardown. Set only where firmware keeps them (VF), which is also
+	 * where the event pool is kept across runtime suspend and FLR.
+	 */
+	int (*rearm_async_event)(struct aie_device *aie, u32 msg_id,
+				 void *handle, int (*cb)(void *, void __iomem *, size_t));
 	/*
 	 * Handle a device/architecture-specific async event type (beyond the
 	 * generic AIE tile error). Returns true when it consumed the event, so
@@ -157,6 +165,8 @@ struct amdxdna_dev_info {
 	/* Asynchronous error reporting data (per AIE generation). */
 	const struct aie_error_lut_set	*luts;
 	u32				async_max_status_code;
+	/* Status firmware rejects a registration with when all slots are taken; 0 if none. */
+	u32				async_full_status_code;
 };
 
 struct amdxdna_carveout;

@@ -61,6 +61,9 @@ struct amdxdna_async_event_resp {
  * @addr: DMA address of the report buffer.
  * @size: report buffer size.
  * @resp: last mailbox response (status and event type) for this slot.
+ * @msg_id: mailbox message ID of the last registration of this slot.
+ * @armed: firmware holds a registration of this slot that has not replied.
+ * @probing: the registration in flight is the resume probe.
  */
 struct amdxdna_async_event {
 	struct aie_device		*aie;
@@ -71,19 +74,27 @@ struct amdxdna_async_event {
 	dma_addr_t			addr;
 	u32				size;
 	struct amdxdna_async_event_resp	resp;
+	u32				msg_id;
+	bool				armed;
+	int				probing;
 };
 
 /**
  * struct amdxdna_async_events - pool of async error report buffer slots
  * @wq: ordered workqueue draining the report workers.
+ * @probe_done: completed by the reply to the resume probe.
  * @event_cnt: number of slots in the pool.
  * @event: event slots, each with its own message buffer.
  */
 struct amdxdna_async_events {
 	struct workqueue_struct		*wq;
+	struct completion		probe_done;
 	u32				event_cnt;
 	struct amdxdna_async_event	event[] __counted_by(event_cnt);
 };
+
+/* Firmware rejects a registration within a millisecond; accepting one sends nothing. */
+#define AMDXDNA_ASYNC_PROBE_TIMEOUT_MS	100
 
 /*
  * The category to driver-error-number and module to driver-error-module maps,
@@ -314,6 +325,11 @@ static int amdxdna_async_error_cb(void *handle, void __iomem *data, size_t size)
 		e->resp.type = readl(data + offsetof(struct amdxdna_async_event_resp, type));
 		wmb(); /* Update status in the end, so that no lock for here */
 		e->resp.status = readl(data + offsetof(struct amdxdna_async_event_resp, status));
+		WRITE_ONCE(e->armed, false);
+		if (xchg(&e->probing, 0)) {
+			complete(&e->events->probe_done);
+			return 0;
+		}
 	}
 	queue_work(e->events->wq, &e->work);
 	return 0;
@@ -321,9 +337,17 @@ static int amdxdna_async_error_cb(void *handle, void __iomem *data, size_t size)
 
 static int amdxdna_async_event_send(struct amdxdna_async_event *e)
 {
+	int ret;
+
 	amdxdna_cache_flush(e->buf, e->size); /* device can access */
-	return e->aie->xdna->dev_info->ops->register_async_event(e->aie, e->addr, e->size,
-								 e, amdxdna_async_error_cb);
+	/* Set before sending: the reply, which clears it, can beat the return. */
+	WRITE_ONCE(e->armed, true);
+	ret = e->aie->xdna->dev_info->ops->register_async_event(e->aie, e->addr, e->size,
+								e, amdxdna_async_error_cb,
+								&e->msg_id);
+	if (ret)
+		WRITE_ONCE(e->armed, false);
+	return ret;
 }
 
 static void amdxdna_async_error_worker(struct work_struct *err_work)
@@ -332,6 +356,7 @@ static void amdxdna_async_error_worker(struct work_struct *err_work)
 	const struct amdxdna_dev_info *info = e->aie->xdna->dev_info;
 	struct amdxdna_dev *xdna = e->aie->xdna;
 	struct aie_device *aie = e->aie;
+	u32 status = e->resp.status;
 
 	/*
 	 * On mailbox channel teardown the registered-event callback runs with
@@ -339,10 +364,17 @@ static void amdxdna_async_error_worker(struct work_struct *err_work)
 	 * at the sentinel. Skip decode and re-registration in that case so the
 	 * dying channel is not touched.
 	 */
-	if (e->resp.status == info->async_max_status_code)
+	if (status == info->async_max_status_code)
 		return;
 
 	e->resp.status = info->async_max_status_code;
+
+	/* A rejected registration carries no report and must not be retried. */
+	if (info->async_full_status_code && status == info->async_full_status_code) {
+		XDNA_WARN(xdna, "Async event buffer 0x%llx rejected, firmware slots full",
+			  (u64)e->addr);
+		return;
+	}
 
 	/* Invalidate stale cache lines before reading the device-written report. */
 	amdxdna_cache_flush(e->buf, e->size);
@@ -384,6 +416,7 @@ int amdxdna_async_events_alloc(struct aie_device *aie,
 		return -ENOMEM;
 
 	events->event_cnt = num_events;
+	init_completion(&events->probe_done);
 
 	events->wq = alloc_ordered_workqueue(AMDXDNA_ASYNC_ERR_WQ_NAME, 0);
 	if (!events->wq) {
@@ -487,6 +520,134 @@ void amdxdna_async_events_free(struct aie_device *aie)
 	for (i = 0; i < events->event_cnt; i++)
 		amdxdna_free_msg_buff(events->event[i].hdl);
 	kfree(events);
+}
+
+/**
+ * amdxdna_async_events_suspend - keep the event pool across a mailbox teardown
+ * @aie: shared aie device owning the pool.
+ *
+ * For firmware that keeps async event registrations across the teardown,
+ * which a VF's does across runtime suspend and FLR: the buffers stay
+ * allocated so a report firmware writes later lands in memory this driver
+ * still owns, and amdxdna_async_events_resume() re-attaches them. Caller
+ * holds dev_lock and has stopped the mailbox.
+ */
+void amdxdna_async_events_suspend(struct aie_device *aie)
+{
+	struct amdxdna_dev *xdna = aie->xdna;
+	struct amdxdna_async_events *events = aie->async_events;
+
+	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
+
+	if (!events)
+		return;
+
+	/* A worker that raced the teardown finds no channel and leaves its slot unarmed. */
+	mutex_unlock(&xdna->dev_lock);
+	flush_workqueue(events->wq);
+	mutex_lock(&xdna->dev_lock);
+}
+
+static int amdxdna_async_events_probe(struct amdxdna_async_events *events,
+				      struct amdxdna_async_event *e, bool *rejected)
+{
+	u32 full = e->aie->xdna->dev_info->async_full_status_code;
+	int ret;
+
+	reinit_completion(&events->probe_done);
+	WRITE_ONCE(e->probing, 1);
+	ret = amdxdna_async_event_send(e);
+	if (ret) {
+		WRITE_ONCE(e->probing, 0);
+		return ret;
+	}
+
+	/* No reply in time means accepted, unless the reply raced the timeout. */
+	if (!wait_for_completion_timeout(&events->probe_done,
+					 msecs_to_jiffies(AMDXDNA_ASYNC_PROBE_TIMEOUT_MS))) {
+		if (xchg(&e->probing, 0)) {
+			*rejected = false;
+			return 0;
+		}
+		wait_for_completion(&events->probe_done);
+	}
+
+	*rejected = e->resp.status == full;
+	e->resp.status = e->aie->xdna->dev_info->async_max_status_code;
+	return 0;
+}
+
+/**
+ * amdxdna_async_events_resume - re-attach a pool kept by amdxdna_async_events_suspend()
+ * @aie: shared aie device owning the pool.
+ *
+ * Firmware cannot release a registration, so registering the kept buffers
+ * again is rejected once its slots are full, while the registrations made
+ * before the teardown still reply on their original message IDs. One
+ * registration probes which case applies: a rejection means firmware still
+ * holds them, so their message IDs are re-armed on the new channel; no reply
+ * means firmware was reloaded with empty slots, so every buffer is
+ * registered again. Caller holds dev_lock with the mailbox started.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int amdxdna_async_events_resume(struct aie_device *aie)
+{
+	struct amdxdna_async_events *events = aie->async_events;
+	u32 old_id[AMDXDNA_MAX_ASYNC_EVENT_BUFS] = { 0 };
+	struct amdxdna_dev *xdna = aie->xdna;
+	const struct amdxdna_dev_ops *ops = xdna->dev_info->ops;
+	struct amdxdna_async_event *probe = NULL;
+	bool rejected = false;
+	int i, ret;
+
+	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
+
+	for (i = 0; i < events->event_cnt; i++) {
+		struct amdxdna_async_event *e = &events->event[i];
+
+		if (!e->hdl)
+			return -ENOMEM;
+		e->resp.status = xdna->dev_info->async_max_status_code;
+		memset(e->buf, 0, e->size);
+		if (READ_ONCE(e->armed)) {
+			old_id[i] = e->msg_id;
+			if (!probe)
+				probe = e;
+		}
+	}
+
+	if (probe && ops->rearm_async_event && xdna->dev_info->async_full_status_code) {
+		ret = amdxdna_async_events_probe(events, probe, &rejected);
+		if (ret)
+			return ret;
+	}
+	XDNA_DBG(xdna, "Async events resumed, firmware kept registrations: %d", rejected);
+
+	for (i = 0; i < events->event_cnt; i++) {
+		struct amdxdna_async_event *e = &events->event[i];
+
+		if (rejected && old_id[i]) {
+			e->msg_id = old_id[i];
+			WRITE_ONCE(e->armed, true);
+			ret = ops->rearm_async_event(aie, e->msg_id, e, amdxdna_async_error_cb);
+			if (ret) {
+				WRITE_ONCE(e->armed, false);
+				return ret;
+			}
+			continue;
+		}
+
+		/* The accepted probe is already registered. */
+		if (!rejected && e == probe)
+			continue;
+
+		ret = amdxdna_async_event_send(e);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 /**

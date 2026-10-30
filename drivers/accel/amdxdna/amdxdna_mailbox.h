@@ -155,4 +155,33 @@ void xdna_mailbox_drain_channel(struct mailbox_channel *mailbox_chann);
 int xdna_mailbox_send_msg(struct mailbox_channel *mailbox_chann,
 			  const struct xdna_mailbox_msg *msg);
 
+/*
+ * xdna_mailbox_send_msg_id() -- Send a message and report its ID
+ *
+ * @mailbox_chann: Mailbox channel handle
+ * @msg: message struct for message information
+ * @msg_id: receives the message ID before the message is sent, or 0 if the
+ *	    transport has none
+ *
+ * Return: If success return 0, otherwise, return error code
+ */
+int xdna_mailbox_send_msg_id(struct mailbox_channel *mailbox_chann,
+			     const struct xdna_mailbox_msg *msg, u32 *msg_id);
+
+/*
+ * xdna_mailbox_rearm_msg() -- wait for a response to a message sent earlier
+ *
+ * @mailbox_chann: Mailbox channel handle
+ * @msg_id: ID the message was sent with, possibly on a previous channel
+ * @handle: handle used for the notify callback
+ * @notify_cb: callback function to notify when the response arrives
+ *
+ * Marks the slot of @msg_id busy without sending anything, for a request
+ * firmware still holds across a channel teardown.
+ *
+ * Return: If success return 0, otherwise, return error code
+ */
+int xdna_mailbox_rearm_msg(struct mailbox_channel *mailbox_chann, u32 msg_id, void *handle,
+			   int (*notify_cb)(void *handle, void __iomem *data, size_t size));
+
 #endif /* _AIE_MAILBOX_ */

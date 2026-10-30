@@ -515,8 +515,8 @@ void xdna_mailbox_drain_channel(struct mailbox_channel *mb_chann)
 	flush_work(&mb_chann->rx_work);
 }
 
-int xdna_mailbox_send_msg(struct mailbox_channel *mb_chann,
-			  const struct xdna_mailbox_msg *msg)
+int xdna_mailbox_send_msg_id(struct mailbox_channel *mb_chann,
+			     const struct xdna_mailbox_msg *msg, u32 *msg_id)
 {
 	struct xdna_msg_header *header;
 	struct mailbox_msg *mb_msg;
@@ -557,6 +557,8 @@ int xdna_mailbox_send_msg(struct mailbox_channel *mb_chann,
 	mb_msg->pkg_size = pkg_size;
 
 	header = &mb_msg->pkg.header;
+	if (msg_id)
+		*msg_id = header->id;
 	/*
 	 * Hardware use total_size and size to split huge message.
 	 * We do not support it here. Thus the values are the same.
@@ -580,6 +582,44 @@ int xdna_mailbox_send_msg(struct mailbox_channel *mb_chann,
 	mutex_unlock(&mb_chann->lock);
 
 	return ret;
+}
+
+int xdna_mailbox_send_msg(struct mailbox_channel *mb_chann,
+			  const struct xdna_mailbox_msg *msg)
+{
+	return xdna_mailbox_send_msg_id(mb_chann, msg, NULL);
+}
+
+int xdna_mailbox_rearm_msg(struct mailbox_channel *mb_chann, u32 msg_id, void *handle,
+			   int (*notify_cb)(void *handle, void __iomem *data, size_t size))
+{
+	struct mailbox_msg *mb_msg;
+	u32 slot;
+
+	if (!mailbox_validate_msgid(msg_id))
+		return -EINVAL;
+
+	slot = msg_id & ~MAGIC_VAL_MASK;
+	if (slot >= mb_chann->msg_buf_num)
+		return -EINVAL;
+
+	mutex_lock(&mb_chann->lock);
+	mb_msg = mailbox_msg_ptr(mb_chann, slot);
+	if (mb_msg->busy) {
+		mutex_unlock(&mb_chann->lock);
+		return -EBUSY;
+	}
+
+	memset(mb_msg, 0, sizeof(*mb_msg));
+	mb_msg->handle = handle;
+	mb_msg->notify_cb = notify_cb;
+	mb_msg->pkg.header.id = msg_id;
+	/* No send follows to order these, so publish them before busy. */
+	smp_store_release(&mb_msg->busy, true);
+	mutex_unlock(&mb_chann->lock);
+
+	MB_DBG(mb_chann, "Re-armed msg_id 0x%x", msg_id);
+	return 0;
 }
 
 struct mailbox_channel *xdna_mailbox_alloc_channel(struct mailbox *mb)
