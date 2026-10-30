@@ -521,11 +521,12 @@ const struct aie_error_lut_set aie4_error_luts = {
 };
 
 int aie4_async_event_register(struct aie_device *aie, dma_addr_t addr, u32 size,
-			      void *handle, int (*cb)(void *, void __iomem *, size_t))
+			      void *handle, int (*cb)(void *, void __iomem *, size_t),
+			      u32 *msg_id)
 {
 	struct amdxdna_dev_hdl *ndev = aie->xdna->dev_handle;
 
-	return aie4_register_asyn_event_msg(ndev, addr, size, handle, cb);
+	return aie4_register_asyn_event_msg(ndev, addr, size, handle, cb, msg_id);
 }
 
 int aie4_get_array_async_error(struct amdxdna_dev_hdl *ndev,

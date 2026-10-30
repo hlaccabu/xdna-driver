@@ -363,7 +363,8 @@ mailbox_get_resp(struct mailbox_channel *mb_chann, struct xdna_msg_header *heade
 	 * user of a reused slot. Keep the busy check as a defensive guard
 	 * against an unexpected response for an idle slot.
 	 */
-	if (unlikely(!mb_msg->busy)) {
+	/* Pairs with the release in mailbox_rearm_msgs(), for handle and notify_cb. */
+	if (unlikely(!smp_load_acquire(&mb_msg->busy))) {
 		MB_WARN_ONCE(mb_chann, "Unexpected response for idle slot 0x%x", msg_id);
 		return 0;
 	}
@@ -515,8 +516,8 @@ void xdna_mailbox_drain_channel(struct mailbox_channel *mb_chann)
 	flush_work(&mb_chann->rx_work);
 }
 
-int xdna_mailbox_send_msg(struct mailbox_channel *mb_chann,
-			  const struct xdna_mailbox_msg *msg)
+int xdna_mailbox_send_msg_id(struct mailbox_channel *mb_chann,
+			     const struct xdna_mailbox_msg *msg, u32 *msg_id)
 {
 	struct xdna_msg_header *header;
 	struct mailbox_msg *mb_msg;
@@ -557,6 +558,8 @@ int xdna_mailbox_send_msg(struct mailbox_channel *mb_chann,
 	mb_msg->pkg_size = pkg_size;
 
 	header = &mb_msg->pkg.header;
+	if (msg_id)
+		*msg_id = header->id;
 	/*
 	 * Hardware use total_size and size to split huge message.
 	 * We do not support it here. Thus the values are the same.
@@ -579,6 +582,39 @@ int xdna_mailbox_send_msg(struct mailbox_channel *mb_chann,
 	}
 	mutex_unlock(&mb_chann->lock);
 
+	return ret;
+}
+
+int xdna_mailbox_send_msg(struct mailbox_channel *mb_chann,
+			  const struct xdna_mailbox_msg *msg)
+{
+	return xdna_mailbox_send_msg_id(mb_chann, msg, NULL);
+}
+
+int xdna_mailbox_cancel_msg(struct mailbox_channel *mb_chann, u32 msg_id, void *handle)
+{
+	struct mailbox_msg *mb_msg;
+	u32 slot;
+	int ret = -ENOENT;
+
+	if (!mailbox_validate_msgid(msg_id))
+		return -EINVAL;
+
+	slot = msg_id & ~MAGIC_VAL_MASK;
+	if (slot >= mb_chann->msg_buf_num)
+		return -EINVAL;
+
+	mutex_lock(&mb_chann->lock);
+	mb_msg = mailbox_msg_ptr(mb_chann, slot);
+	if (mb_msg->busy && mb_msg->handle == handle &&
+	    mb_msg->pkg.header.id == msg_id) {
+		/* Pairs with the acquire in mailbox_acquire_msgid(). */
+		smp_store_release(&mb_msg->busy, false);
+		ret = 0;
+	}
+	mutex_unlock(&mb_chann->lock);
+
+	MB_DBG(mb_chann, "Cancel msg_id 0x%x, ret %d", msg_id, ret);
 	return ret;
 }
 
@@ -627,12 +663,52 @@ void xdna_mailbox_free_channel(struct mailbox_channel *mb_chann)
 	kfree(mb_chann);
 }
 
+static int mailbox_rearm_msgs(struct mailbox_channel *mb_chann,
+			      const struct xdna_mailbox_rearm *rearm, u32 n_rearm)
+{
+	struct mailbox_msg *mb_msg;
+	u32 i, slot;
+
+	for (i = 0; i < n_rearm; i++) {
+		if (!mailbox_validate_msgid(rearm[i].msg_id))
+			return -EINVAL;
+
+		slot = rearm[i].msg_id & ~MAGIC_VAL_MASK;
+		if (slot >= mb_chann->msg_buf_num)
+			return -EINVAL;
+
+		mb_msg = mailbox_msg_ptr(mb_chann, slot);
+		if (mb_msg->busy)
+			return -EBUSY;
+
+		mb_msg->handle = rearm[i].handle;
+		mb_msg->notify_cb = rearm[i].notify_cb;
+		mb_msg->pkg.header.id = rearm[i].msg_id;
+		/* No send follows to order these, so publish them with busy. */
+		smp_store_release(&mb_msg->busy, true);
+		MB_DBG(mb_chann, "Re-armed msg_id 0x%x", rearm[i].msg_id);
+	}
+
+	return 0;
+}
+
 int
 xdna_mailbox_start_channel(struct mailbox_channel *mb_chann,
 			   const struct xdna_mailbox_chann_res *x2i,
 			   const struct xdna_mailbox_chann_res *i2x,
 			   u32 iohub_int_addr,
 			   int mb_irq, u32 n_msg)
+{
+	return xdna_mailbox_start_channel_rearm(mb_chann, x2i, i2x, iohub_int_addr,
+						mb_irq, n_msg, NULL, 0);
+}
+
+int
+xdna_mailbox_start_channel_rearm(struct mailbox_channel *mb_chann,
+				 const struct xdna_mailbox_chann_res *x2i,
+				 const struct xdna_mailbox_chann_res *i2x,
+				 u32 iohub_int_addr, int mb_irq, u32 n_msg,
+				 const struct xdna_mailbox_rearm *rearm, u32 n_rearm)
 {
 	int ret;
 
@@ -662,13 +738,17 @@ xdna_mailbox_start_channel(struct mailbox_channel *mb_chann,
 	mb_chann->x2i_tail = mailbox_get_tailptr(mb_chann, CHAN_RES_X2I);
 	mb_chann->i2x_head = mailbox_get_headptr(mb_chann, CHAN_RES_I2X);
 
+	ret = mailbox_rearm_msgs(mb_chann, rearm, n_rearm);
+	if (ret) {
+		MB_ERR(mb_chann, "Failed to re-arm messages ret %d", ret);
+		goto free_msg_buf;
+	}
+
 	/* Everything look good. Time to enable irq handler */
 	ret = request_irq(mb_irq, mailbox_irq_handler, 0, MAILBOX_NAME, mb_chann);
 	if (ret) {
 		MB_ERR(mb_chann, "Failed to request irq %d ret %d", mb_irq, ret);
-		kfree(mb_chann->msg_buf);
-		mb_chann->msg_buf = NULL;
-		return ret;
+		goto free_msg_buf;
 	}
 
 	mb_chann->bad_state = false;
@@ -676,6 +756,11 @@ xdna_mailbox_start_channel(struct mailbox_channel *mb_chann,
 
 	MB_DBG(mb_chann, "Mailbox channel started (irq: %d)", mb_chann->msix_irq);
 	return 0;
+
+free_msg_buf:
+	kfree(mb_chann->msg_buf);
+	mb_chann->msg_buf = NULL;
+	return ret;
 }
 
 void xdna_mailbox_stop_channel(struct mailbox_channel *mb_chann)
