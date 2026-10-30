@@ -231,7 +231,8 @@ int aie2_pm_set_dpm(struct amdxdna_dev_hdl *ndev, u32 dpm_level);
 /* aie2_error.c */
 extern const struct aie_error_lut_set aie2_error_luts;
 int aie2_async_event_register(struct aie_device *aie, dma_addr_t addr, u32 size,
-			      void *handle, int (*cb)(void *, void __iomem *, size_t));
+			      void *handle, int (*cb)(void *, void __iomem *, size_t),
+			      u32 *msg_id);
 int aie2_get_array_async_error(struct amdxdna_dev_hdl *ndev,
 			       struct amdxdna_drm_get_array *args);
 

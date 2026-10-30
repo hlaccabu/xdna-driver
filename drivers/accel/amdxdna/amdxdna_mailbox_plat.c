@@ -903,6 +903,14 @@ unlock:
 	return 0;
 }
 
+int xdna_mailbox_send_msg_id(struct mailbox_channel *mailbox_chann,
+			     const struct xdna_mailbox_msg *msg, u32 *msg_id)
+{
+	if (msg_id)
+		*msg_id = 0;
+	return xdna_mailbox_send_msg(mailbox_chann, msg);
+}
+
 /*
  * Register a cert completion with the shared completion IPI.  There is no
  * per-cert interrupt to request here; the fan-out just needs to know which

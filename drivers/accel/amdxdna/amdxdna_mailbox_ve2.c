@@ -392,3 +392,11 @@ int xdna_mailbox_send_msg(struct mailbox_channel *mailbox_chann,
 	mutex_unlock(&mb->lock);
 	return ret;
 }
+
+int xdna_mailbox_send_msg_id(struct mailbox_channel *mailbox_chann,
+			     const struct xdna_mailbox_msg *msg, u32 *msg_id)
+{
+	if (msg_id)
+		*msg_id = 0;
+	return xdna_mailbox_send_msg(mailbox_chann, msg);
+}
