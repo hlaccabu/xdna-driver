@@ -18,6 +18,7 @@
 #include "aie.h"
 #include "amdxdna_error.h"
 #include "amdxdna_drv.h"
+#include "amdxdna_mailbox.h"
 
 /* Private workqueue name (also the worker/rescuer thread name). */
 #define AMDXDNA_ASYNC_ERR_WQ_NAME	"amdxdna_async_err"
@@ -61,6 +62,11 @@ struct amdxdna_async_event_resp {
  * @addr: DMA address of the report buffer.
  * @size: report buffer size.
  * @resp: last mailbox response (status and event type) for this slot.
+ * @msg_id: mailbox message ID of the last registration of this slot.
+ * @armed: firmware holds a registration of this slot that has not replied.
+ * @rearmed: @msg_id was re-armed at mailbox start, pending resume.
+ * @probe_id: mailbox message ID of the resume probe registration.
+ * @probe_state: AMDXDNA_ASYNC_PROBE_* state of the resume probe.
  */
 struct amdxdna_async_event {
 	struct aie_device		*aie;
@@ -71,18 +77,36 @@ struct amdxdna_async_event {
 	dma_addr_t			addr;
 	u32				size;
 	struct amdxdna_async_event_resp	resp;
+	u32				msg_id;
+	bool				armed;
+	bool				rearmed;
+	u32				probe_id;
+	int				probe_state;
 };
 
 /**
  * struct amdxdna_async_events - pool of async error report buffer slots
  * @wq: ordered workqueue draining the report workers.
+ * @probes_left: resume probes still waiting for a rejection.
+ * @probe_done: completed once every resume probe has been rejected.
  * @event_cnt: number of slots in the pool.
  * @event: event slots, each with its own message buffer.
  */
 struct amdxdna_async_events {
 	struct workqueue_struct		*wq;
+	atomic_t			probes_left;
+	struct completion		probe_done;
 	u32				event_cnt;
 	struct amdxdna_async_event	event[] __counted_by(event_cnt);
+};
+
+/* Firmware rejects a registration within a millisecond; accepting one sends nothing. */
+#define AMDXDNA_ASYNC_PROBE_TIMEOUT_MS	100
+
+enum {
+	AMDXDNA_ASYNC_PROBE_NONE,	/* no probe, or it was accepted and replied with a report */
+	AMDXDNA_ASYNC_PROBE_PENDING,	/* no reply yet: accepted if it stays so */
+	AMDXDNA_ASYNC_PROBE_REJECTED,	/* firmware still holds the registration */
 };
 
 /*
@@ -314,16 +338,70 @@ static int amdxdna_async_error_cb(void *handle, void __iomem *data, size_t size)
 		e->resp.type = readl(data + offsetof(struct amdxdna_async_event_resp, type));
 		wmb(); /* Update status in the end, so that no lock for here */
 		e->resp.status = readl(data + offsetof(struct amdxdna_async_event_resp, status));
+		WRITE_ONCE(e->armed, false);
 	}
 	queue_work(e->events->wq, &e->work);
 	return 0;
 }
 
+static int amdxdna_async_probe_cb(void *handle, void __iomem *data, size_t size)
+{
+	struct amdxdna_async_event *e = handle;
+	struct amdxdna_async_events *events = e->events;
+	u32 full = e->aie->xdna->dev_info->async_full_status_code;
+	int state;
+
+	/* Channel teardown: resume, if still waiting, times out on its own. */
+	if (!data)
+		return 0;
+
+	if (readl(data + offsetof(struct amdxdna_async_event_resp, status)) == full) {
+		if (cmpxchg(&e->probe_state, AMDXDNA_ASYNC_PROBE_PENDING,
+			    AMDXDNA_ASYNC_PROBE_REJECTED) != AMDXDNA_ASYNC_PROBE_PENDING) {
+			XDNA_WARN(e->aie->xdna, "Late rejection of async event probe 0x%x",
+				  e->probe_id);
+			return 0;
+		}
+		if (atomic_dec_and_test(&events->probes_left))
+			complete(&events->probe_done);
+		return 0;
+	}
+
+	/* Accepted, and already replied with a report: handle it as one. */
+	state = cmpxchg(&e->probe_state, AMDXDNA_ASYNC_PROBE_PENDING, AMDXDNA_ASYNC_PROBE_NONE);
+	amdxdna_async_error_cb(handle, data, size);
+	if (state == AMDXDNA_ASYNC_PROBE_PENDING && atomic_dec_and_test(&events->probes_left))
+		complete(&events->probe_done);
+	return 0;
+}
+
 static int amdxdna_async_event_send(struct amdxdna_async_event *e)
 {
+	int ret;
+
 	amdxdna_cache_flush(e->buf, e->size); /* device can access */
-	return e->aie->xdna->dev_info->ops->register_async_event(e->aie, e->addr, e->size,
-								 e, amdxdna_async_error_cb);
+	/* Set before sending: the reply, which clears it, can beat the return. */
+	WRITE_ONCE(e->armed, true);
+	ret = e->aie->xdna->dev_info->ops->register_async_event(e->aie, e->addr, e->size,
+								e, amdxdna_async_error_cb,
+								&e->msg_id);
+	if (ret)
+		WRITE_ONCE(e->armed, false);
+	return ret;
+}
+
+static int amdxdna_async_event_send_probe(struct amdxdna_async_event *e)
+{
+	int ret;
+
+	/* No flush: firmware may still own the buffer through the kept registration. */
+	WRITE_ONCE(e->probe_state, AMDXDNA_ASYNC_PROBE_PENDING);
+	ret = e->aie->xdna->dev_info->ops->register_async_event(e->aie, e->addr, e->size,
+								e, amdxdna_async_probe_cb,
+								&e->probe_id);
+	if (ret)
+		WRITE_ONCE(e->probe_state, AMDXDNA_ASYNC_PROBE_NONE);
+	return ret;
 }
 
 static void amdxdna_async_error_worker(struct work_struct *err_work)
@@ -332,6 +410,7 @@ static void amdxdna_async_error_worker(struct work_struct *err_work)
 	const struct amdxdna_dev_info *info = e->aie->xdna->dev_info;
 	struct amdxdna_dev *xdna = e->aie->xdna;
 	struct aie_device *aie = e->aie;
+	u32 status = e->resp.status;
 
 	/*
 	 * On mailbox channel teardown the registered-event callback runs with
@@ -339,10 +418,17 @@ static void amdxdna_async_error_worker(struct work_struct *err_work)
 	 * at the sentinel. Skip decode and re-registration in that case so the
 	 * dying channel is not touched.
 	 */
-	if (e->resp.status == info->async_max_status_code)
+	if (status == info->async_max_status_code)
 		return;
 
 	e->resp.status = info->async_max_status_code;
+
+	/* A rejected registration carries no report and must not be retried. */
+	if (info->async_full_status_code && status == info->async_full_status_code) {
+		XDNA_WARN(xdna, "Async event buffer 0x%llx rejected, firmware slots full",
+			  (u64)e->addr);
+		return;
+	}
 
 	/* Invalidate stale cache lines before reading the device-written report. */
 	amdxdna_cache_flush(e->buf, e->size);
@@ -363,9 +449,10 @@ reregister:
 	 * Skip re-registration if the event pool is being torn down. The free
 	 * path clears async_events under dev_lock before draining this worker,
 	 * so a drained worker cannot re-arm firmware on an already-stopped
-	 * mailbox channel.
+	 * mailbox channel. Also skip it if amdxdna_async_events_resume()
+	 * registered the slot again while this report waited for dev_lock.
 	 */
-	if (aie->async_events && amdxdna_async_event_send(e))
+	if (aie->async_events && !READ_ONCE(e->armed) && amdxdna_async_event_send(e))
 		XDNA_WARN(xdna, "Unable to register async event");
 	mutex_unlock(&xdna->dev_lock);
 }
@@ -384,6 +471,7 @@ int amdxdna_async_events_alloc(struct aie_device *aie,
 		return -ENOMEM;
 
 	events->event_cnt = num_events;
+	init_completion(&events->probe_done);
 
 	events->wq = alloc_ordered_workqueue(AMDXDNA_ASYNC_ERR_WQ_NAME, 0);
 	if (!events->wq) {
@@ -487,6 +575,179 @@ void amdxdna_async_events_free(struct aie_device *aie)
 	for (i = 0; i < events->event_cnt; i++)
 		amdxdna_free_msg_buff(events->event[i].hdl);
 	kfree(events);
+}
+
+/**
+ * amdxdna_async_events_suspend - keep the event pool across a mailbox teardown
+ * @aie: shared aie device owning the pool.
+ *
+ * For firmware that keeps async event registrations across the teardown,
+ * which a VF's does across runtime suspend and FLR: the buffers stay
+ * allocated so a report firmware writes later lands in memory this driver
+ * still owns, and amdxdna_async_events_resume() re-attaches them. Caller
+ * holds dev_lock and has stopped the mailbox.
+ */
+void amdxdna_async_events_suspend(struct aie_device *aie)
+{
+	struct amdxdna_dev *xdna = aie->xdna;
+	struct amdxdna_async_events *events = aie->async_events;
+
+	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
+
+	if (!events)
+		return;
+
+	/* A worker that raced the teardown finds no channel and leaves its slot unarmed. */
+	mutex_unlock(&xdna->dev_lock);
+	flush_workqueue(events->wq);
+	mutex_lock(&xdna->dev_lock);
+}
+
+static bool amdxdna_async_events_can_rearm(struct aie_device *aie)
+{
+	const struct amdxdna_dev_info *info = aie->xdna->dev_info;
+
+	return info->ops->cancel_async_event && info->async_full_status_code;
+}
+
+/**
+ * amdxdna_async_events_rearm_list - registrations to re-arm at mailbox start
+ * @aie: shared aie device owning the pool.
+ * @rearm: filled with one entry per registration firmware may still hold.
+ * @max: number of entries @rearm has room for.
+ *
+ * Every registration still waiting for a reply when the pool was suspended.
+ * The caller passes them to xdna_mailbox_start_channel_rearm() so their
+ * replies are delivered, and their message IDs not reused, from the moment
+ * the channel starts. amdxdna_async_events_resume() then settles which ones
+ * firmware really kept.
+ *
+ * Return: number of entries filled.
+ */
+u32 amdxdna_async_events_rearm_list(struct aie_device *aie, struct xdna_mailbox_rearm *rearm,
+				    u32 max)
+{
+	struct amdxdna_async_events *events = aie->async_events;
+	u32 i, n = 0;
+
+	if (!events || !amdxdna_async_events_can_rearm(aie))
+		return 0;
+
+	for (i = 0; i < events->event_cnt; i++) {
+		struct amdxdna_async_event *e = &events->event[i];
+
+		e->rearmed = n < max && READ_ONCE(e->armed);
+		if (!e->rearmed)
+			continue;
+		rearm[n].msg_id = e->msg_id;
+		rearm[n].handle = e;
+		rearm[n].notify_cb = amdxdna_async_error_cb;
+		n++;
+	}
+
+	return n;
+}
+
+/**
+ * amdxdna_async_events_resume - re-attach a pool kept by amdxdna_async_events_suspend()
+ * @aie: shared aie device owning the pool.
+ *
+ * The registrations still waiting at suspend were re-armed when the mailbox
+ * started (see amdxdna_async_events_rearm_list()); firmware still holds them
+ * unless it was reloaded. A registration cannot be released, and one of a
+ * full set is rejected, so this settles which ones it holds:
+ *
+ * The buffers firmware cannot be holding are registered first, so they take
+ * exactly the slots it has free: those not waiting at suspend, and those
+ * whose re-armed registration has since replied. Each buffer still waiting
+ * is then registered again as a probe. A rejection proves the original
+ * registration is still held, and it stays re-armed. A probe left
+ * unanswered was accepted into a slot that no registration was holding, so
+ * the probe replaces the original, whose re-armed ID is cancelled.
+ * Caller holds dev_lock with the mailbox started.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int amdxdna_async_events_resume(struct aie_device *aie)
+{
+	struct amdxdna_async_events *events = aie->async_events;
+	bool probed[AMDXDNA_MAX_ASYNC_EVENT_BUFS] = { 0 };
+	struct amdxdna_dev *xdna = aie->xdna;
+	int i, ret = 0, probes = 0, rejected = 0;
+
+	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
+
+	for (i = 0; i < events->event_cnt; i++) {
+		struct amdxdna_async_event *e = &events->event[i];
+
+		if (!e->hdl) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		if (e->rearmed && READ_ONCE(e->armed))
+			continue;
+
+		/*
+		 * A re-armed registration that replied left a report for the
+		 * queued worker, which sees armed set and does not register again.
+		 */
+		if (!e->rearmed) {
+			e->resp.status = xdna->dev_info->async_max_status_code;
+			memset(e->buf, 0, e->size);
+		}
+		ret = amdxdna_async_event_send(e);
+		if (ret)
+			goto out;
+	}
+
+	atomic_set(&events->probes_left, 1);
+	reinit_completion(&events->probe_done);
+	for (i = 0; i < events->event_cnt; i++) {
+		struct amdxdna_async_event *e = &events->event[i];
+
+		if (!e->rearmed || !READ_ONCE(e->armed))
+			continue;
+
+		atomic_inc(&events->probes_left);
+		if (amdxdna_async_event_send_probe(e)) {
+			/* Unsent: firmware holds the original, as far as is known. */
+			atomic_dec(&events->probes_left);
+			continue;
+		}
+		probed[i] = true;
+		probes++;
+	}
+	if (!atomic_dec_and_test(&events->probes_left))
+		wait_for_completion_timeout(&events->probe_done,
+					    msecs_to_jiffies(AMDXDNA_ASYNC_PROBE_TIMEOUT_MS));
+
+	for (i = 0; i < events->event_cnt; i++) {
+		struct amdxdna_async_event *e = &events->event[i];
+
+		if (!probed[i])
+			continue;
+
+		switch (xchg(&e->probe_state, AMDXDNA_ASYNC_PROBE_NONE)) {
+		case AMDXDNA_ASYNC_PROBE_PENDING:
+			/* Accepted: it replaces the original, which firmware dropped. */
+			xdna->dev_info->ops->cancel_async_event(aie, e->msg_id, e);
+			e->msg_id = e->probe_id;
+			break;
+		case AMDXDNA_ASYNC_PROBE_NONE:
+			/* Accepted and already consumed by a report; the worker re-registers. */
+			xdna->dev_info->ops->cancel_async_event(aie, e->msg_id, e);
+			break;
+		default:
+			rejected++;
+			break;
+		}
+	}
+
+	XDNA_DBG(xdna, "Async events resumed, %d probed, %d kept by firmware", probes, rejected);
+out:
+	for (i = 0; i < events->event_cnt; i++)
+		events->event[i].rearmed = false;
+	return ret;
 }
 
 /**

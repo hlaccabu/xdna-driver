@@ -106,6 +106,35 @@ xdna_mailbox_start_channel(struct mailbox_channel *mb_chann,
 			   u32 xdna_mailbox_intr_reg,
 			   int mb_irq, u32 n_msg);
 
+/**
+ * struct xdna_mailbox_rearm - a request firmware still holds from a previous channel
+ * @msg_id: ID the request was sent with
+ * @handle: handle passed to @notify_cb
+ * @notify_cb: callback for the response, as for xdna_mailbox_send_msg()
+ */
+struct xdna_mailbox_rearm {
+	u32		msg_id;
+	void		*handle;
+	int		(*notify_cb)(void *handle, void __iomem *data, size_t size);
+};
+
+/*
+ * xdna_mailbox_start_channel_rearm() -- start a channel waiting on old requests
+ *
+ * Same as xdna_mailbox_start_channel(), but first marks the slot of each
+ * @rearm entry busy, so a response firmware sends for it is delivered to its
+ * callback and its ID is not reused, even before the interrupt is enabled.
+ * PCI transport only.
+ *
+ * Return: If success return 0, otherwise, return error code
+ */
+int
+xdna_mailbox_start_channel_rearm(struct mailbox_channel *mb_chann,
+				 const struct xdna_mailbox_chann_res *x2i,
+				 const struct xdna_mailbox_chann_res *i2x,
+				 u32 xdna_mailbox_intr_reg, int mb_irq, u32 n_msg,
+				 const struct xdna_mailbox_rearm *rearm, u32 n_rearm);
+
 /*
  * xdna_mailbox_set_async_cb() -- register an async notification handler
  *
@@ -154,5 +183,32 @@ void xdna_mailbox_drain_channel(struct mailbox_channel *mailbox_chann);
  */
 int xdna_mailbox_send_msg(struct mailbox_channel *mailbox_chann,
 			  const struct xdna_mailbox_msg *msg);
+
+/*
+ * xdna_mailbox_send_msg_id() -- Send a message and report its ID
+ *
+ * @mailbox_chann: Mailbox channel handle
+ * @msg: message struct for message information
+ * @msg_id: receives the message ID before the message is sent, or 0 if the
+ *	    transport has none
+ *
+ * Return: If success return 0, otherwise, return error code
+ */
+int xdna_mailbox_send_msg_id(struct mailbox_channel *mailbox_chann,
+			     const struct xdna_mailbox_msg *msg, u32 *msg_id);
+
+/*
+ * xdna_mailbox_cancel_msg() -- stop waiting for a response
+ *
+ * @mailbox_chann: Mailbox channel handle
+ * @msg_id: ID of the message to stop waiting on
+ * @handle: handle the message was registered with
+ *
+ * Frees the slot of @msg_id without calling its callback, for a request
+ * firmware is known not to answer. PCI transport only.
+ *
+ * Return: 0 if the slot was freed, -ENOENT if it is not waiting with @handle
+ */
+int xdna_mailbox_cancel_msg(struct mailbox_channel *mailbox_chann, u32 msg_id, void *handle);
 
 #endif /* _AIE_MAILBOX_ */

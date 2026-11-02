@@ -532,7 +532,8 @@ void aie4_configure_hw_context_dpm(struct amdxdna_dev_hdl *ndev, u32 hw_context_
 }
 
 int aie4_register_asyn_event_msg(struct amdxdna_dev_hdl *ndev, dma_addr_t addr, u32 size,
-				 void *handle, int (*cb)(void *, void __iomem *, size_t))
+				 void *handle, int (*cb)(void *, void __iomem *, size_t),
+				 u32 *msg_id)
 {
 	struct aie4_msg_async_event_config_req req = { 0 };
 	struct xdna_mailbox_msg msg = {
@@ -560,7 +561,7 @@ int aie4_register_asyn_event_msg(struct amdxdna_dev_hdl *ndev, dma_addr_t addr, 
 		XDNA_DBG(ndev->aie.xdna, "opcode 0x%x not allowed", msg.opcode);
 		return -EOPNOTSUPP;
 	}
-	return xdna_mailbox_send_msg(ndev->aie.mgmt_chann, &msg);
+	return xdna_mailbox_send_msg_id(ndev->aie.mgmt_chann, &msg, msg_id);
 }
 
 int aie4_get_aie_coredump(struct amdxdna_hwctx *hwctx,

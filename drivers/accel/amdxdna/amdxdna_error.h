@@ -89,6 +89,8 @@ enum amdxdna_error_module {
  * which runs after total_col is known. Both counts must match — the channel
  * is sized AMDXDNA_MAX_ASYNC_EVENT_BUFS + 1 (one extra for other management
  * commands), so the pool cannot exceed AMDXDNA_MAX_ASYNC_EVENT_BUFS slots.
+ * aie4 sizes it 2 * AMDXDNA_MAX_ASYNC_EVENT_BUFS + 1 so a resume can probe
+ * every kept registration at once; see amdxdna_async_events_resume().
  */
 #define AMDXDNA_MAX_ASYNC_EVENT_BUFS	4
 
@@ -97,6 +99,7 @@ struct amdxdna_async_error;
 struct amdxdna_async_events;
 struct work_struct;
 struct amdxdna_drm_get_array;
+struct xdna_mailbox_rearm;
 
 /*
  * AIE module type and error category. These enums are common to all AIE
@@ -200,6 +203,10 @@ void amdxdna_aie_fill_decode(enum aie_error_category cat, u32 mod_type,
 
 int amdxdna_async_events_alloc(struct aie_device *aie, u32 total_col);
 void amdxdna_async_events_free(struct aie_device *aie);
+void amdxdna_async_events_suspend(struct aie_device *aie);
+u32 amdxdna_async_events_rearm_list(struct aie_device *aie, struct xdna_mailbox_rearm *rearm,
+				    u32 max);
+int amdxdna_async_events_resume(struct aie_device *aie);
 bool amdxdna_async_events_queue_work(struct aie_device *aie, struct work_struct *work);
 int amdxdna_get_array_last_async_error(struct aie_device *aie,
 				       struct amdxdna_drm_get_array *args);
