@@ -1700,7 +1700,7 @@ std::vector<test_case> test_list {
     TEST_POSITIVE, {npu1, npu4, npu3, npu3vf, npu12}, {}, TEST_create_free_uptr_bo, {XCL_BO_FLAGS_HOST_ONLY, 0, 128}
   },
   test_case{ "io test with user pointer BOs", {},
-    TEST_POSITIVE, {npu1, npu4, npu3, npu3vf}, {}, TEST_io_with_ubuf_bo, {}
+    TEST_POSITIVE, {npu1, npu4, npu3, npu3vf, npu12}, {}, TEST_io_with_ubuf_bo, {}
   },
   test_case{ "multi-command preempt full ELF io test real kernel good run", {},
     TEST_POSITIVE, {npu4, npu3}, {amdxdna}, TEST_preempt_full_elf_io, { IO_TEST_FORCE_PREEMPTION, 8 }

@@ -550,6 +550,13 @@ paddr() const
   return reinterpret_cast<uint64_t>(m_bos[0]->m_vaddr->get());
 }
 
+bool
+buffer::
+is_user_ptr() const
+{
+  return m_uptr != nullptr;
+}
+
 void
 buffer::
 bind_hwctx(const hwctx& hwctx)

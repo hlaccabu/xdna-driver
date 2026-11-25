@@ -1643,6 +1643,60 @@ static int amdxdna_flush_bo(struct amdxdna_gem_obj *abo, u64 offset, u64 size)
 }
 
 /*
+ * drm_clflush_*() is x86-only; elsewhere sync the requested range of the BO's
+ * page-backed streaming DMA mapping. The range is not rounded to cachelines:
+ * the arch invalidate cleans partial lines at either end, while rounding out
+ * would discard dirty CPU data sharing those lines.
+ *
+ * Sync one page at a time: dma_sync_single_*() translates only its start
+ * address, and an IOMMU may merge physically discontiguous pages into one DMA
+ * segment. The BO's pages are whole and page aligned, so a page-bounded chunk
+ * of a segment is one physical page (assuming IOMMU granule <= PAGE_SIZE).
+ */
+static int amdxdna_sync_bo_sgt(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo,
+			       u32 direction, u64 offset, u64 size)
+{
+	struct device *dev = xdna->ddev.dev;
+	struct scatterlist *sg;
+	u64 end, pos = 0;
+	int i;
+
+	if (offset >= abo->mem.size)
+		return -EINVAL;
+
+	if (check_add_overflow(offset, size, &end))
+		return -EINVAL;
+
+	end = min(abo->mem.size, end);
+
+	for_each_sgtable_dma_sg(abo->mem.sgt, sg, i) {
+		u64 len = sg_dma_len(sg);
+		u64 start = max(offset, pos);
+		u64 stop = min(end, pos + len);
+
+		while (start < stop) {
+			u64 chunk = min(stop, round_down(start, PAGE_SIZE) + PAGE_SIZE) - start;
+
+			if (direction == SYNC_DIRECT_FROM_DEVICE)
+				dma_sync_single_range_for_cpu(dev, sg_dma_address(sg),
+							      start - pos, chunk,
+							      DMA_BIDIRECTIONAL);
+			else
+				dma_sync_single_range_for_device(dev, sg_dma_address(sg),
+								 start - pos, chunk,
+								 DMA_BIDIRECTIONAL);
+			start += chunk;
+		}
+
+		pos += len;
+		if (pos >= end)
+			break;
+	}
+
+	return 0;
+}
+
+/*
  * The sync bo ioctl is to make sure the CPU cache is in sync with memory.
  * This is required because NPU is not cache coherent device. CPU cache
  * flushing/invalidation is expensive so it is best to handle this outside
@@ -1695,7 +1749,12 @@ int amdxdna_drm_sync_bo_ioctl(struct drm_device *dev,
 			goto put_obj;
 		}
 
-		ret = amdxdna_flush_bo(abo, args->offset, args->size);
+		if (!IS_ENABLED(CONFIG_X86) && abo->mem.sgt &&
+		    sg_page(abo->mem.sgt->sgl))
+			ret = amdxdna_sync_bo_sgt(xdna, abo, args->direction,
+						  args->offset, args->size);
+		else
+			ret = amdxdna_flush_bo(abo, args->offset, args->size);
 		amdxdna_gem_unpin(abo);
 
 		if (ret) {

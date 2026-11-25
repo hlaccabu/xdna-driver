@@ -113,6 +113,9 @@ public:
   uint64_t
   paddr() const;
 
+  bool
+  is_user_ptr() const;
+
   size_t
   size() const;
 
