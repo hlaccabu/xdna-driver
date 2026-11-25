@@ -57,6 +57,12 @@ class pdev_umq_nc : public pdev_umq
 public:
   using pdev_umq::pdev_umq;
 
+  // User-pointer BOs are cacheable host memory, so they need the driver's
+  // cache maintenance even though driver-allocated BOs do not.
+  void
+  sync_bo(buffer& bo, xrt_core::buffer_handle::direction dir,
+          size_t size, size_t offset) const override;
+
   // Non-coherent: the kernel cannot maintain caches for an imported cacheable
   // dmabuf, so xrt::bo::sync() on an imported BO is a no-op. Warn once per
   // imported BO unless XRT_NO_WARN_IMPORT_BO_CREATION is set.
